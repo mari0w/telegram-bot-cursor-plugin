@@ -93,6 +93,7 @@ Messages that were edited have a mark.
 Long messages are shortened on screen.
 
 Ask the AI to list saved chats.
+Groups the bot joined before the plugin went live appear in the list only after someone sends a message there.
 Then ask it to show messages from a chat.
 It shows saved messages from that chat in full.
 被规则收起的消息仍会保存。你可以随时要求查看。
@@ -683,6 +684,7 @@ See the official [Privacy Mode page](https://core.telegram.org/bots/features#pri
 
 ### Local storage
 
+`my_chat_member` updates save bot joins and leaves without adding messages.
 The server saves messages in `~/.telegram-bot-cursor-plugin/<bot ID>/store.json`.
 It saves message filter config in the same bot directory as `filters.json`.
 It creates the bot directory with mode `0700` and both files with mode `0600`.

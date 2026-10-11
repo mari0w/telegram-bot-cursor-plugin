@@ -10,7 +10,7 @@ import { addUpdates, openStore } from "../store.js";
 
 const env = { TELEGRAM_BOT_TOKEN: "101:fake-one", TELEGRAM_BOT_TOKEN_2: "202:fake-two" };
 const allowed_updates = ["message", "edited_message", "channel_post", "edited_channel_post",
-  "business_connection", "business_message", "edited_business_message", "deleted_business_messages"];
+  "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"];
 const update = (id, chat = 7) => ({ update_id: id, message: { message_id: id, date: id,
   chat: { id: chat, type: "private", first_name: "User" }, text: `Message ${id}` } });
 
@@ -92,6 +92,34 @@ test("A location message is shown and a new_chat_members message is filtered as 
   const saved = (await openStore(dataDir, 101).read()).chats[7].messages;
   assert.equal(saved[0].service, undefined);
   assert.equal(saved[1].service, true);
+});
+
+test("Receive saves bot joins and leaves without messages", async (t) => {
+  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: [
+    { update_id: 2, my_chat_member: { chat: { id: -10, type: "group", title: "Joined", extra: "raw" },
+      new_chat_member: { status: "member" } } },
+    { update_id: 3, my_chat_member: { chat: { id: -20, type: "group", title: "Left" },
+      new_chat_member: { status: "left" } } },
+  ] }));
+  const store = openStore(dataDir, 101);
+  const state = await store.read();
+  addUpdates(state, [update(1)]);
+  state.pending = [];
+  await store.write(state);
+  const output = await call("read_new_messages");
+  assert.match(output, /no new messages/);
+  assert.doesNotMatch(output, /\(chat -10\)|\(chat -20\)| #\d+ /);
+  assert.ok(calls[0].params.allowed_updates.includes("my_chat_member"));
+  assert.deepEqual(await call("list_chats"), [
+    { id: 7, chat_key: "7", type: "private", first_name: "User", message_count: 1, last_message_date: 1 },
+    { id: -10, chat_key: "-10", type: "group", title: "Joined", message_count: 0, last_message_date: null },
+    { id: -20, chat_key: "-20", type: "group", title: "Left", message_count: 0, last_message_date: null, left: true },
+  ]);
+  const saved = await store.read();
+  assert.deepEqual(saved.chats[-10], { chat: { id: -10, type: "group", title: "Joined" }, messages: [] });
+  assert.deepEqual(saved.chats[-20], { chat: { id: -20, type: "group", title: "Left" }, messages: [], left: true });
+  assert.deepEqual(saved.pending, []);
+  assert.equal(saved.offset, 4);
 });
 
 test("Receive omits stale or unknown offsets and saves the last update time only for nonempty batches", async (t) => {

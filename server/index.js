@@ -267,7 +267,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           const updates = await callApi(entry.token, "getUpdates", {
             ...(batch === 0 && resetOffset ? {} : { offset: state.offset }), timeout: wait, limit: 100,
             allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
-              "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+              "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
           }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
           addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
           await store.write(state);
@@ -385,10 +385,11 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const state = await openStore(dataDir, entry.id).read();
-      return textResult(Object.entries(state.chats).map(([chat_key, { chat, messages, business_connection_id }]) => ({ ...chat,
+      return textResult(Object.entries(state.chats).map(([chat_key, { chat, messages, business_connection_id, left }]) => ({ ...chat,
         chat_key, ...(business_connection_id ? { id: chat_key, business_connection_id } : {}),
-        message_count: messages.length, last_message_date: Math.max(...messages.map((message) => message.date)),
-      })).sort((a, b) => b.last_message_date - a.last_message_date), tokens);
+        message_count: messages.length, last_message_date: messages.length ? Math.max(...messages.map((message) => message.date)) : null,
+        ...(left ? { left: true } : {}),
+      })).sort((a, b) => (b.last_message_date ?? -1) - (a.last_message_date ?? -1)), tokens);
     } catch (error) {
       return errorResult(error, tokens);
     }

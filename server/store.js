@@ -106,6 +106,16 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
 export function addUpdates(store, updates) {
   let messages = [];
   for (const update of updates) {
+    if (update.my_chat_member) {
+      const { chat, new_chat_member } = update.my_chat_member;
+      let status = new_chat_member.status;
+      if (["member", "administrator", "left", "kicked"].includes(status)) {
+        const entry = store.chats[chat.id] ??= { chat: {}, messages: [] };
+        entry.chat = pick(chat, ["id", "type", "title", "username", "first_name", "last_name"]);
+        if (status === "left" || status === "kicked") entry.left = true;
+        else delete entry.left;
+      }
+    }
     if (update.business_connection) addBusinessConnection(store, update.business_connection);
     if (update.deleted_business_messages) {
       const { business_connection_id, chat, message_ids } = update.deleted_business_messages;
