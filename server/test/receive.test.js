@@ -51,6 +51,7 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: batches.shift() }));
   const result = await call("read_new_messages", { timeout: 2 });
   assert.match(result, /bot 101: 2 new messages\. offset 14\./);
+  assert.match(result, /\[photo id=large\]/);
   const firstSaved = (await openStore(dataDir, 101).read()).chats[7].messages[1];
   assert.deepEqual(firstSaved, { update_id: 10, message_id: 10, date: 10, chat_id: 7,
     from: { id: 9, is_bot: false, first_name: "User" }, text: "Message 10",
@@ -243,12 +244,66 @@ test("Pending edits keep their place; owner messages stay out and deleted messag
 
 test("Store keeps the last 2000 messages per chat", () => {
   const state = { offset: 0, chats: {}, pending: [] };
-  addUpdates(state, Array.from({ length: 2050 }, (_, i) => update(i + 1)));
+  addUpdates(state, Array.from({ length: 2000 }, (_, i) => update(i + 1)));
+  state.pending = [];
+  addUpdates(state, Array.from({ length: 50 }, (_, i) => update(i + 2001)));
   addUpdates(state, [update(2051, 8)]);
   assert.equal(state.chats[7].messages.length, 2000);
   assert.equal(state.chats[7].messages[0].message_id, 51);
   assert.equal(state.chats[7].messages.at(-1).message_id, 2050);
   assert.equal(state.chats[8].messages.length, 1);
+});
+
+test("Store keeps pending messages beyond the chat limit", () => {
+  const state = { offset: 0, chats: {}, pending: [] };
+  addUpdates(state, Array.from({ length: 2050 }, (_, i) => update(i + 1)));
+  assert.equal(state.chats[7].messages.length, 2050);
+  assert.ok(state.pending.every(([, id]) => state.chats[7].messages.some((message) => message.message_id === id)));
+  state.pending = [["7", 1], ["8", 2]];
+  addUpdates(state, [update(2051)]);
+  assert.equal(state.chats[7].messages.length, 2001);
+  assert.equal(state.chats[7].messages[0].message_id, 1);
+  assert.equal(state.chats[7].messages[1].message_id, 52);
+});
+
+test("Pending pages put private chats, mentions, and replies first in each mode", async (t) => {
+  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
+  const store = openStore(dataDir, 101);
+  for (const mode of ["all", "for_me", undefined]) {
+    const state = { offset: 0, chats: {}, pending: [] };
+    const updates = Array.from({ length: 6 }, (_, i) => update(i + 1, i === 2 ? 7 : -10));
+    for (const item of updates) {
+      if (item.message.chat.id === -10) item.message.chat = { id: -10, type: "group", title: "Group" };
+    }
+    updates[3].message.text = "@my_bot Hello";
+    updates[5].message.reply_to_message = { message_id: 10, from: { id: 101 } };
+    addUpdates(state, updates);
+    await store.write(state);
+    const ids = (text) => [...text.matchAll(/ #(\d+) /g)].map((match) => Number(match[1]));
+    assert.deepEqual(ids(await call("read_new_messages", { limit: 2, mode })), [3, 4]);
+    assert.deepEqual((await store.read()).pending, [["-10", 1], ["-10", 2], ["-10", 5], ["-10", 6]]);
+    assert.deepEqual(ids(await call("read_new_messages", { limit: 2, mode })), mode === "for_me" ? [6] : [6, 1]);
+    assert.deepEqual((await store.read()).pending, [["-10", 2], ["-10", 5]]);
+  }
+});
+
+test("Chat history removes shown messages from pending without repeats", async (t) => {
+  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
+  const store = openStore(dataDir, 101);
+  for (const args of [{ limit: 2 }, { message_id: 3, context: 0 }]) {
+    const state = { offset: 0, chats: {}, pending: [] };
+    const updates = [update(1), update(2), update(3), update(1, 8)];
+    updates[2].message.reply_to_message = { message_id: 1 };
+    addUpdates(state, updates);
+    await store.write(state);
+    const history = await call("get_chat_messages", { chat_id: 7, ...args });
+    const ids = [...history.matchAll(/ #(\d+) /g)].map((match) => Number(match[1]));
+    assert.deepEqual(ids, args.message_id ? [1, 3] : [2, 3]);
+    assert.deepEqual((await store.read()).pending, [["7", args.message_id ? 2 : 1], ["8", 1]]);
+    const next = await call("read_new_messages");
+    for (const id of ids) assert.ok(!next.includes(`(chat 7) #${id} `));
+    assert.match(next, /\(chat 8\) #1 /);
+  }
 });
 
 test("Local tools list seen chats and select recent messages without fetch", async (t) => {

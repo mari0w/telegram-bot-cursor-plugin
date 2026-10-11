@@ -94,8 +94,10 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
   const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
   if (index === -1) entry.messages.push(message);
   else entry.messages[index] = message;
-  entry.messages = entry.messages.slice(-CHAT_MESSAGE_LIMIT);
   store.pending ??= [];
+  const pendingIds = new Set(store.pending.filter(([chat]) => chat === key).map(([, id]) => id));
+  const dropped = entry.messages.slice(0, -CHAT_MESSAGE_LIMIT).filter((item) => pendingIds.has(item.message_id));
+  entry.messages = [...dropped, ...entry.messages.slice(-CHAT_MESSAGE_LIMIT)];
   if (!outgoing && !message.outgoing
     && !store.pending.some(([chat, message_id]) => chat === key && message_id === message.message_id)) {
     store.pending.push([key, message.message_id]);

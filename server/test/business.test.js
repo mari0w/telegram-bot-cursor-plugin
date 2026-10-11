@@ -101,6 +101,65 @@ test("Business send previews the owner identity and sends with the connection", 
   assert.equal(saved.text, "Sent [REDACTED]");
 });
 
+test("Receive looks up missing and empty connections before it stores owner messages", async (t) => {
+  let updates;
+  const { call, store, calls } = await setup(t, (method) => ({ ok: true, result: method === "getMe"
+    ? { id: 101, username: "my_bot" } : method === "getBusinessConnection" ? connection : updates }));
+  for (const business of [undefined, { conn: {} }]) {
+    await store.write({ offset: 0, chats: {}, pending: [], ...(business ? { business } : {}) });
+    updates = [{ update_id: 1, business_message: message(1, 1, "Owner context") }];
+    const before = calls.filter(({ method }) => method === "getBusinessConnection").length;
+    assert.match(await call("read_new_messages"), /no new messages/);
+    const lookups = calls.filter(({ method }) => method === "getBusinessConnection");
+    assert.equal(lookups.length, before + 1);
+    assert.deepEqual(lookups.at(-1).params, { business_connection_id: "conn" });
+    const state = await store.read();
+    assert.equal(state.chats["conn:7"].messages[0].outgoing, true);
+    assert.deepEqual(state.pending, []);
+    assert.equal(state.business.conn.user_id, 1);
+  }
+});
+
+test("Receive looks up unknown connections for edits and deletions and keeps polling on lookup failure", async (t) => {
+  let updates;
+  let fail = false;
+  const { call, store, calls } = await setup(t, (method) => method === "getBusinessConnection" && fail
+    ? { ok: false, error_code: 400, description: "Unknown connection" }
+    : { ok: true, result: method === "getMe" ? { id: 101, username: "my_bot" }
+      : method === "getBusinessConnection" ? connection : updates });
+  for (const type of ["edited_business_message", "deleted_business_messages", "business_message"]) {
+    await store.write({ offset: 0, chats: {}, pending: [] });
+    fail = type === "business_message";
+    updates = [{ update_id: 1, [type]: type === "deleted_business_messages"
+      ? { business_connection_id: "conn", chat: { id: 7 }, message_ids: [1] } : message(1, 1) }];
+    if (fail) updates.push({ update_id: 2, business_message: message(2, 1) });
+    const before = calls.filter(({ method }) => method === "getBusinessConnection").length;
+    const output = await call("read_new_messages");
+    assert.match(output, fail ? /2 new messages/ : /no new messages/);
+    assert.equal(calls.filter(({ method }) => method === "getBusinessConnection").length, before + 1);
+    assert.equal((await store.read()).offset, fail ? 3 : 2);
+  }
+});
+
+test("Business forward uses the bot identity and sends no connection ID", async (t) => {
+  const forwarded = { ...message(2) };
+  delete forwarded.business_connection_id;
+  const { call, store, calls } = await setup(t, () => ({ ok: true, result: forwarded }));
+  const state = await store.read();
+  addMessage(state, message(1));
+  await store.write(state);
+  for (const chat_id of ["conn:7", "unknown:7"]) {
+    const args = { chat_id, from_chat_id: 8, message_id: 1 };
+    const preview = await call("forward_message", args);
+    assert.match(preview.notice, /^The bot forwards this as itself\./);
+    assert.doesNotMatch(preview.notice, /以你本人的身份/);
+    assert.deepEqual(preview.preview.params, { chat_id: 7, from_chat_id: 8, message_id: 1 });
+    await call("forward_message", { ...args, confirm: true });
+    assert.deepEqual(calls.at(-1), { method: "forwardMessage",
+      params: { chat_id: 7, from_chat_id: 8, message_id: 1 } });
+  }
+});
+
 test("Business delete previews deleteBusinessMessages and removes only the stored business message", async (t) => {
   const { call, store, calls } = await setup(t, () => ({ ok: true, result: true }));
   const state = await store.read();

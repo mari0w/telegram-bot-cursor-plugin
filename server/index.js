@@ -8,7 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { businessStatus, loadBots, selectBot } from "./bots.js";
 import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
-import { addBusinessConnection, addMessage, addUpdates, openStore } from "./store.js";
+import { addBusinessConnection, addMessage, addUpdates, chatKey, openStore } from "./store.js";
 import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages,
   ownerNamesHint, previewFilterImpact, readFilters, writeFilters } from "./filter.js";
 
@@ -70,7 +70,9 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       const state = await store.read();
       const { chat_id: key, message_id } = params;
       const businessChat = typeof key === "string" && key.match(/^(.+):(-?\d+)$/);
-      if (businessChat && (deletesMessage || state.business?.[businessChat[1]])) {
+      if (businessChat && method === "forwardMessage") {
+        params = { ...params, chat_id: Number(businessChat[2]) };
+      } else if (businessChat && (deletesMessage || state.business?.[businessChat[1]])) {
         if (deletesMessage) {
           method = "deleteBusinessMessages";
           params = { business_connection_id: businessChat[1], message_ids: [message_id] };
@@ -262,6 +264,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
         const resetOffset = state.last_update_at === undefined ? state.offset > 0
           : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
         let more = false;
+        const checkedConnections = new Set();
         for (let batch = 0; batch < UPDATE_CALL_LIMIT; batch++) {
           const wait = batch === 0 ? timeout : 0;
           const updates = await callApi(entry.token, "getUpdates", {
@@ -269,6 +272,17 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
             allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
               "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
           }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
+          const connectionIds = new Set(updates.map((update) => (update.business_message
+            ?? update.edited_business_message ?? update.deleted_business_messages)?.business_connection_id).filter(Boolean));
+          for (const business_connection_id of connectionIds) {
+            if (state.business?.[business_connection_id]?.user_id !== undefined || checkedConnections.has(business_connection_id)) continue;
+            checkedConnections.add(business_connection_id);
+            try {
+              const connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
+                ?? await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
+              addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
+            } catch { /* Keep polling if the connection lookup fails. */ }
+          }
           addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
           await store.write(state);
           more = updates.length === 100;
@@ -276,13 +290,19 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
         }
         state.pending = state.pending.filter(([key, id]) =>
           state.chats[key]?.messages.some((message) => message.message_id === id));
-        const messages = state.pending.slice(0, limit).map(([key, id]) =>
-          state.chats[key].messages.find((message) => message.message_id === id));
         const me = await filterMe(entry, state);
         const rules = await readFilters(store.dir);
+        const priority = (message) => {
+          const chat = state.chats[chatKey(message.chat_id, message.business_connection_id)].chat;
+          return chat.type === "private" || classify(message, chat, rules, me, "for_me") === "full";
+        };
+        const messages = state.pending.map(([key, id]) =>
+          state.chats[key].messages.find((message) => message.message_id === id))
+          .sort((a, b) => Number(priority(b)) - Number(priority(a))).slice(0, limit);
+        const shown = new Set(messages.map((message) => `${chatKey(message.chat_id, message.business_connection_id)}:${message.message_id}`));
+        state.pending = state.pending.filter(([key, id]) => !shown.has(`${key}:${id}`));
         const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
-          offset: state.offset, more, mode, pending: state.pending.slice(limit) }), tokens);
-        state.pending.splice(0, limit);
+          offset: state.offset, more, mode, pending: state.pending }), tokens);
         await store.write(state);
         return result;
       });
@@ -303,35 +323,40 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
-      const state = await store.read();
-      const rules = await readFilters(store.dir);
-      const chat = state.chats[chat_id];
-      const saved = (chat?.messages ?? []).slice().sort((a, b) => a.message_id - b.message_id);
-      let messages;
-      const lines = [];
-      if (message_id !== undefined) {
-        const index = saved.findIndex((message) => message.message_id === message_id);
-        messages = index === -1 ? [] : saved.slice(Math.max(0, index - context), index + context + 1)
-          .map((message) => ({ message, prefix: message.message_id === message_id ? "→ " : "" }));
-        const replyId = saved[index]?.reply_to_message_id;
-        if (replyId !== undefined) {
-          const original = saved.find((message) => message.message_id === replyId);
-          if (!original) lines.push("原消息没有保存在本地。");
-          else if (!messages.some(({ message }) => message.message_id === replyId)) {
-            messages.unshift({ message: original, prefix: "原消息：" });
+      return await store.withLock(async () => {
+        const state = await store.read();
+        const rules = await readFilters(store.dir);
+        const chat = state.chats[chat_id];
+        const saved = (chat?.messages ?? []).slice().sort((a, b) => a.message_id - b.message_id);
+        let messages;
+        const lines = [];
+        if (message_id !== undefined) {
+          const index = saved.findIndex((message) => message.message_id === message_id);
+          messages = index === -1 ? [] : saved.slice(Math.max(0, index - context), index + context + 1)
+            .map((message) => ({ message, prefix: message.message_id === message_id ? "→ " : "" }));
+          const replyId = saved[index]?.reply_to_message_id;
+          if (replyId !== undefined) {
+            const original = saved.find((message) => message.message_id === replyId);
+            if (!original) lines.push("原消息没有保存在本地。");
+            else if (!messages.some(({ message }) => message.message_id === replyId)) {
+              messages.unshift({ message: original, prefix: "原消息：" });
+            }
           }
+        } else {
+          messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
+            .slice(-limit).map((message) => ({ message, prefix: "" }));
         }
-      } else {
-        messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
-          .slice(-limit).map((message) => ({ message, prefix: "" }));
-      }
-      const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
-      const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
-      lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
-      if (!lines.length) lines.push("No saved messages.");
-      const hidden = messages.length - visible.length;
-      if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
-      return plainTextResult(lines.join("\n"), tokens);
+        const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
+        const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
+        lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
+        if (!lines.length) lines.push("No saved messages.");
+        const hidden = messages.length - visible.length;
+        if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
+        const shown = new Set(visible.map(({ message }) => message.message_id));
+        state.pending = state.pending.filter(([key, id]) => key !== String(chat_id) || !shown.has(id));
+        await store.write(state);
+        return plainTextResult(lines.join("\n"), tokens);
+      });
     } catch (error) {
       return errorResult(error, tokens);
     }

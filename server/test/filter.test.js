@@ -300,16 +300,16 @@ test("Format compact lines, summaries, and filtered counts", () => {
   const output = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, more: true, mode: "for_me",
     chats: { 7: { chat: privateChat }, [-1001]: { chat: group } }, messages: [
       { ...message, chat_id: 7, text: "a".repeat(501), edited: true,
-        reply_to_message_id: 44, file: { kind: "document", file_name: "file.pdf" } },
+        reply_to_message_id: 44, file: { kind: "document", file_name: "file.pdf", file_id: "doc-id" } },
       { ...message, text: "group text", date: 1791685800 },
       { ...message, text: "older group text" },
       { ...message, service: true },
-      { ...message, chat_id: 7, text: "hello\nworld", file: { kind: "photo" } },
+      { ...message, chat_id: 7, text: "hello\nworld", file: { kind: "photo", file_id: "photo-id" } },
     ] });
   assert.ok(output.includes("a".repeat(500) + "…"));
   assert.ok(!output.includes("a".repeat(501)));
-  assert.match(output, /\[private\] Alice Smith \(chat 7\) #45 .*@Bob \(reply to #44\) \(edited\): \[document file.pdf\]/);
-  assert.match(output, /\[photo\] hello world/);
+  assert.match(output, /\[private\] Alice Smith \(chat 7\) #45 .*@Bob \(reply to #44\) \(edited\): \[document file.pdf id=doc-id\]/);
+  assert.match(output, /\[photo id=photo-id\] hello world/);
   assert.match(output, /Group summary:\n- Ops \(chat -1001\): 2 new, last 2026-10-11 02:30Z/);
   assert.doesNotMatch(output, /group text/);
   assert.match(output, /已收起 1 条。Call get_chat_messages with show_filtered=true to view them\./);
@@ -360,7 +360,7 @@ test("Message context shows the original reply and nearby saved messages with fi
     text: i === 0 ? `Original ${Object.values(env).join(" ")}` : i === 3 ? "hidden" : `Message ${i + 1}`,
     ...(i === 7 ? { reply_to_message_id: 1 } : {}),
   }));
-  await store.write({ offset: 0, chats: {
+  await store.write({ offset: 0, pending: [...messages.map((item) => [String(group.id), item.message_id]), ["7", 1]], chats: {
     [group.id]: { chat: group, messages: [...messages].reverse() },
     7: { chat: { id: 7, type: "private" }, messages: [{ ...message, message_id: 1, text: "Other chat" }] },
   } });
@@ -375,6 +375,7 @@ test("Message context shows the original reply and nearby saved messages with fi
   assert.match(output, /\n→ \[group\] Ops .*#8 .*Message 8/);
   assert.match(output, /已收起 1 条/);
   assert.doesNotMatch(output, /hidden|Other chat/);
+  assert.deepEqual((await store.read()).pending, [2, 4, 14, 15].map((id) => [String(group.id), id]).concat([["7", 1]]));
   assert.deepEqual(ids(await read({ context: 1 })), [1, 7, 8, 9]);
   assert.doesNotMatch(await read({ context: 7, show_filtered: true }), /原消息：/);
   assert.deepEqual(ids(await read({ show_filtered: true })), [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);

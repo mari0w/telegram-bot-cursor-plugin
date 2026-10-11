@@ -155,7 +155,7 @@ export function formatMessage(message, chat) {
   const text = (message.text ?? "").replace(/[\r\n]+/g, " ");
   const sender = message.from?.username ? `@${message.from.username}` : message.from?.first_name;
   const reply = message.reply_to_message_id === undefined ? "" : ` (reply to #${message.reply_to_message_id})`;
-  const file = message.file ? ` [${message.file.kind}${message.file.file_name ? ` ${message.file.file_name}` : ""}]` : "";
+  const file = message.file ? ` [${message.file.kind}${message.file.file_name ? ` ${message.file.file_name}` : ""} id=${message.file.file_id}]` : "";
   return `[${message.business_connection_id ? "business " : ""}${chat.type}] ${chatName(chat)} (chat ${chatKey(chat.id, message.business_connection_id)}) #${message.message_id} ${time(message.date)}`
     + `${sender ? ` ${sender}` : ""}${message.outgoing ? " (you)" : ""}${reply}${message.edited ? " (edited)" : ""}${sender ? ":" : ""}${file}${message.service === true ? " [service message]" : ""}`
     + `${text ? ` ${text.length > 500 ? text.slice(0, 500) + "…" : text}` : ""}`;
