@@ -7,12 +7,33 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../index.js";
 import { addBusinessConnection, openStore } from "../store.js";
-import { classify, describeFilterChanges, filterFields, formatMessages, readFilters } from "../filter.js";
+import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages, previewFilterImpact, readFilters } from "../filter.js";
 
 const me = { id: "101", username: "my_bot" };
 const group = { id: -1001, type: "group", title: "Ops" };
 const message = { message_id: 45, date: 1791684360, chat_id: group.id,
   from: { id: 9, username: "Bob", first_name: "Bob" }, text: "hello" };
+
+test("Sender names include display names and usernames with fallbacks", () => {
+  for (const [from, expected] of [
+    [{ id: 9, first_name: "婷婷", username: "Ting10086" }, "婷婷 (@Ting10086)"],
+    [{ id: 9, first_name: "婷婷" }, "婷婷"],
+    [{ id: 9, first_name: "Alice", last_name: "Smith", username: "alice" }, "Alice Smith (@alice)"],
+    [{ id: 9, first_name: "Alice", last_name: "Smith" }, "Alice Smith"],
+    [{ id: 9, username: "Ting10086" }, "@Ting10086"],
+    [{ id: 9 }, "9"],
+    [undefined, "未知发送者"],
+  ]) {
+    const item = { ...message, from };
+    const prefix = "[group] Ops (chat -1001) #45 2026-10-11 02:06Z";
+    assert.equal(formatMessage(item, group), `${prefix}${from ? ` ${expected}:` : ""} hello`);
+    assert.equal(formatMessage({ ...item, outgoing: true }, group),
+      `${prefix}${from ? ` ${expected}` : ""} (you)${from ? ":" : ""} hello`);
+    const preview = previewFilterImpact({}, { exclude_keywords: ["hello"] },
+      { [group.id]: { chat: group, messages: [item] } }, me);
+    assert.ok(preview.includes(`\n- ${expected}（Ops）：hello`));
+  }
+});
 
 test("Rule summaries describe only additions and removals with saved names", () => {
   const empty = Object.fromEntries(filterFields.map((key) => [key, []]));
@@ -22,7 +43,7 @@ test("Rule summaries describe only additions and removals with saved names", () 
     ["include_keywords", "紧急", "群里包含『紧急』的消息完整显示给你。", "取消群里包含『紧急』的消息完整显示的规则。"],
     ["exclude_regex", "order\\s+\\d+", "符合「order\\s+\\d+」这种写法的消息不再显示。", "恢复显示符合「order\\s+\\d+」这种写法的消息。"],
     ["include_regex", "check.*", "符合「check.*」这种写法的消息完整显示。", "取消符合「check.*」这种写法的消息完整显示的规则。"],
-    ["block_users", 9, "不再显示 Bob 发的消息。", "恢复显示 Bob 发的消息。"],
+    ["block_users", 9, "不再显示 Bob (@Bob) 发的消息。", "恢复显示 Bob (@Bob) 发的消息。"],
     ["allow_users", "@Bob", "完整显示 @Bob 发的群消息。", "取消完整显示 @Bob 发的群消息的规则。"],
     ["mute_chats", -1001, "「Ops」只显示新消息条数。", "取消「Ops」只显示新消息条数的规则。"],
     ["allow_chats", "-1001", "「Ops」的消息全部完整显示。", "取消「Ops」的消息全部完整显示的规则。"],
@@ -88,6 +109,17 @@ async function setup(t, reply) {
   } };
 }
 
+test("set_filters previews show the sender display name and username", async (t) => {
+  const { call, store } = await setup(t, () => me);
+  await store.write({ offset: 0, chats: {
+    [group.id]: { chat: group, messages: [{ ...message,
+      from: { id: 9, first_name: "婷婷", username: "Ting10086" } }] },
+  } });
+  const preview = (await call("set_filters", { block_users: [9] })).content[0].text;
+  assert.ok(preview.split("\n").includes("不再显示 婷婷 (@Ting10086) 发的消息。"));
+  assert.ok(preview.split("\n").includes("- 婷婷 (@Ting10086)（Ops）：hello"));
+});
+
 test("Filter defaults, preview mistakes, pattern validation, and saved results do not leak tokens", async (t) => {
   const { call, store } = await setup(t, (method) => {
     assert.equal(method, "getMe");
@@ -105,18 +137,18 @@ test("Filter defaults, preview mistakes, pattern validation, and saved results d
   assert.deepEqual(JSON.parse((await call("get_filters")).content[0].text).protected_words, ["投诉", "退款", "急"]);
   const fields = { exclude_rules: [{ words: ["订单", "查单"], chats: [group.id], users: [9] }] };
   const preview = (await call("set_filters", fields)).content[0].text;
-  assert.match(preview, /同时包含『订单』『查单』的消息（只在『Ops』）（只针对 Bob）不再显示给你/);
+  assert.match(preview, /同时包含『订单』『查单』的消息（只在『Ops』）（只针对 Bob \(@Bob\)）不再显示给你/);
   assert.match(preview, /按现在已保存的消息算，会多收起 3 条。/);
   const mistakes = preview.split("可能误收的消息（请看一下）：\n")[1].split("\n要保存")[0].split("\n");
   assert.equal(mistakes.length, 2);
-  assert.ok(mistakes.every((line) => line.startsWith("Bob（Ops）：") && Array.from(line.split("：")[1]).length <= 61));
+  assert.ok(mistakes.every((line) => line.startsWith("Bob (@Bob)（Ops）：") && Array.from(line.split("：")[1]).length <= 61));
   assert.match(preview, /Point out the messages that might be hidden by mistake\./);
   assert.deepEqual((await readFilters(store.dir)).exclude_rules, []);
   const privatePreview = (await call("set_filters", { exclude_rules: [
     { words: ["订单"], chats: [7], include_for_me: true },
   ] })).content[0].text;
   assert.match(privatePreview, /私聊和@你的消息也会收起/);
-  assert.match(privatePreview, /可能误收的消息（请看一下）：\nBob（李四）：订单 查单/);
+  assert.match(privatePreview, /可能误收的消息（请看一下）：\nBob \(@Bob\)（李四）：订单 查单/);
   const saved = (await call("set_filters", { ...fields, confirm: true })).content[0].text;
   assert.match(saved, /^已保存。/);
   assert.match(saved, /如果有消息被误收，直接告诉我，我再改规则（改之前也会先问你）。$/);
@@ -308,7 +340,7 @@ test("Format compact lines, summaries, and filtered counts", () => {
     ] });
   assert.ok(output.includes("a".repeat(500) + "…"));
   assert.ok(!output.includes("a".repeat(501)));
-  assert.match(output, /\[private\] Alice Smith \(chat 7\) #45 .*@Bob \(reply to #44\) \(edited\): \[document file.pdf id=doc-id\]/);
+  assert.match(output, /\[private\] Alice Smith \(chat 7\) #45 .*Bob \(@Bob\) \(reply to #44\) \(edited\): \[document file.pdf id=doc-id\]/);
   assert.match(output, /\[photo id=photo-id\] hello world/);
   assert.match(output, /Group summary:\n- Ops \(chat -1001\): 2 new, last 2026-10-11 02:30Z/);
   assert.doesNotMatch(output, /group text/);
@@ -317,7 +349,7 @@ test("Format compact lines, summaries, and filtered counts", () => {
   const all = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, mode: "all",
     chats: { [-1001]: { chat: group } }, messages: [{ ...message, service: true }, message] });
   assert.equal(all.split("\n").length, 3);
-  assert.match(all, /@Bob: hello/);
+  assert.match(all, /Bob \(@Bob\): hello/);
   assert.match(all, /已收起 1 条/);
   assert.doesNotMatch(all, /Group summary|service message/);
   assert.equal(formatMessages({ bot_id: 101, messages: [] }), "bot 101: no new messages.");

@@ -58,8 +58,11 @@ export function classify(message, chat, rules, me = {}, mode = rules.default_mod
 const time = (date) => new Date(date * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z";
 const chatName = (chat) => chat.title || [chat.first_name, chat.last_name].filter(Boolean).join(" ")
   || chat.username || String(chat.id);
-const senderName = (from) => [from?.first_name, from?.last_name].filter(Boolean).join(" ")
-  || (from?.username ? `@${from.username}` : String(from?.id ?? "未知发送者"));
+const senderName = (from) => {
+  const name = [from?.first_name, from?.last_name].filter(Boolean).join(" ");
+  return name ? name + (from?.username ? ` (@${from.username})` : "")
+    : (from?.username ? `@${from.username}` : String(from?.id ?? "未知发送者"));
+};
 
 export function describeFilterChanges(current, next, chats) {
   const userName = (user) => {
@@ -153,7 +156,7 @@ export function previewFilterImpact(current, next, chats, me) {
 
 export function formatMessage(message, chat) {
   const text = (message.text ?? "").replace(/[\r\n]+/g, " ");
-  const sender = message.from?.username ? `@${message.from.username}` : message.from?.first_name;
+  const sender = message.from ? senderName(message.from) : "";
   const reply = message.reply_to_message_id === undefined ? "" : ` (reply to #${message.reply_to_message_id})`;
   const file = message.file ? ` [${message.file.kind}${message.file.file_name ? ` ${message.file.file_name}` : ""} id=${message.file.file_id}]` : "";
   return `[${message.business_connection_id ? "business " : ""}${chat.type}] ${chatName(chat)} (chat ${chatKey(chat.id, message.business_connection_id)}) #${message.message_id} ${time(message.date)}`

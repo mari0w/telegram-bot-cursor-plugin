@@ -342,6 +342,9 @@ It acknowledges other update types and does not store them.
 If the result says that more updates are waiting, call it again.
 Call `list_chats` to find saved chats.
 Call `get_chat_messages` to read messages for one chat.
+Message lines show the sender name (first name and last name).
+If the sender has a username, the line adds it in parentheses, such as `婷婷 (@Ting10086)`.
+Without a name, the line shows `@username` or the user ID.
 
 `read_new_messages` shows the next page from the saved queue.
 Set `limit` to an integer from 1 to 1000. The default is 200.
