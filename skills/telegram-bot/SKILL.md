@@ -17,11 +17,18 @@ Use the tools in version 1.1.0.
 8. Never paste a bot token into chat.
 9. Ask the user to change the token in plugin Configure only for a 401 Unauthorized error.
 
-`read_new_messages` runs once per call.
-It does not poll in the background.
+`read_new_messages` fetches batches of 100 updates, with at most 20 requests per call.
+Only the first request uses `timeout`. Later requests use 0.
+It saves each batch before the next request.
+It shows the next page of saved incoming messages, even if no new updates arrive.
+Set `limit` from 1 to 1000. The default is 200 messages per page.
+Current modes and filters apply to each page.
 If the result says that more updates are waiting, call it again.
-Tell the user that Telegram keeps incoming updates for no more than 24 hours.
-Messages older than 24 hours on the server are lost if nobody reads them.
+If it says 「还有 N 条没显示」, call it again for the next page or use the remaining counts to select a group.
+It does not poll in the background.
+Tell the user to let the AI fetch new messages at least once every 24 hours.
+Telegram drops updates older than 24 hours.
+The local store keeps the last 2000 messages per chat.
 
 ## Setup guide
 
@@ -32,19 +39,25 @@ Tell only the next step in plain words: which chat to open, which command to sen
 Do not use technical words with the owner.
 Wait until the owner says the step is done.
 Call `get_me` or `list_bots` again to check before the next step.
+Turning off privacy mode is required during setup.
+Tell the owner to send `/setprivacy` to BotFather, select the bot, and tap **Disable**.
 After privacy mode is off, tell the owner to remove the bot from old groups and add it again.
 After the owner connects the bot, call `read_new_messages` once to receive the connection.
 Then call `get_me` again to check it.
 Telegram Premium is not needed for business bots.
 Bot API 10.0 removed this requirement. See the [Bot API changelog](https://core.telegram.org/bots/api-changelog).
 
+## Daily summary
+
+1. Call `read_new_messages` until there is no 「还有 N 条没显示」. Also repeat if more updates are waiting. If you stop early, note the remaining counts for each group.
+2. Check the message count for each group.
+3. Read important groups in batches with `get_chat_messages`. Use `limit` and `before_message_id` to read earlier batches.
+4. Write the summary and the to-do list.
+
+Remind the user to let the AI fetch new messages at least once every 24 hours.
+Telegram drops updates older than 24 hours.
+
 ## Telegram Business
-
-For a daily summary:
-
-1. Call `read_new_messages`. Repeat if more updates are waiting.
-2. Call `get_chat_messages` for each chat that needs more context.
-3. Give the owner a daily summary and a to-do list.
 
 Use the business chat key from the result for history and send tools.
 Sending in a business chat sends as the owner.
@@ -79,23 +92,47 @@ Show the preview and point out possible mistakes.
 Confirm only after the owner agrees.
 
 `read_new_messages` returns compact text.
+The initial default mode is `all`.
+It shows all readable incoming messages in full, including private chats, business private chats, and all groups.
+Set `mode="for_me"` for one call to use the rules below.
 Private chats, including business private chats, are messages for the owner.
-Bot and owner `@mentions`, and replies to the bot or owner, are also messages for the owner.
-The owner is the user of a known business connection.
-These messages show in full by default.
+An `@mention` means an `@mention` of the owner.
+Match text that contains `@` plus a name in `owner_names`, or the username of a known business connection owner. Ignore case.
+Owner names can have an `@` prefix. Plain names also match when text contains `@` plus the name.
+Find replies to the owner by the owner's user ID from a known business connection, not by a name.
+Mentions of the bot and replies to the bot also count.
+In `for_me` mode, these messages show in full.
 Allowed chats, allowed users, and include matches also show in full.
-Other group, supergroup, and channel messages use one summary line per chat.
-Muted chats show a summary line only, including messages for the owner.
+In `for_me` mode, other group, supergroup, and channel messages use one summary line per chat.
+In both modes, muted chats show a summary line only, including messages for the owner.
 Messages that are 收起 are saved too.
 The count says 「已收起 N 条。」.
-Use `all=true` to show all incoming new messages as full lines.
+Omit `mode` to use the saved `default_mode`.
+Use `set_filters` with `default_mode="for_me"` to make this the default, or `default_mode="all"` to restore full text.
+Show the preview and save with `confirm=true` only after the owner agrees.
+When the owner turns on `for_me` and `owner_names` is empty, ask for their Telegram username in plain words.
+Tell them to open Telegram Settings and find the username under their name.
+If a business connection has a username, offer it as the suggestion and ask the owner to confirm it.
+Call `get_filters` and keep existing names when you prepare `owner_names`.
+Use `set_filters` to preview the names. Show the preview and save with `confirm=true` only after the owner agrees.
+An empty `owner_names` adds a final `AI:` hint to each `for_me` read, even when there are no new messages.
+Follow this hint. It includes a suggested username only when a business connection has one.
 Use `get_chat_messages` with `show_filtered=true` to view saved messages that are 收起.
 Text longer than 500 characters is cut to 500 characters plus `…`.
 
+When an `@mention` of the owner or a reply to the owner is unclear, call `get_chat_messages` with `chat_id` and `message_id`.
+Read the original message and the context yourself before asking the user.
+The tool shows the saved original reply message first with 「原消息：」.
+If it has a reply ID but the original is not saved, it says 「原消息没有保存在本地。」.
+It then shows nearby messages, oldest first, with 「→ 」 before the selected message.
+Set `context` from 0 to 50 for the number of messages on each side. The default is 5.
+The tool uses local messages from the same chat and ignores `limit` and `before_message_id` when `message_id` is set.
+Hiding rules still apply unless `show_filtered=true`.
+
 The config is `~/.telegram-bot-cursor-plugin/<bot ID>/filters.json`.
 The config file uses mode `0600`. The bot directory uses mode `0700`.
-All fields are arrays.
-They are empty by default except `protected_words`.
+`default_mode` is `"all"` or `"for_me"`. A missing file or field uses `"all"`.
+All other fields are arrays. They are empty by default except `protected_words`.
 A missing file or missing `protected_words` field uses `["投诉", "退款", "急"]`.
 An explicit empty array removes these protected words.
 
@@ -109,6 +146,7 @@ An explicit empty array removes these protected words.
 - `block_users` puts away messages from these sender IDs or usernames.
 - `exclude_rules` contains objects with optional `words`, `pattern`, `chats`, `users`, and `include_for_me`.
 - `protected_words` keeps text with any listed word from all exclude rules.
+- `owner_names` contains the owner's usernames, with or without `@`, or names. Default: `[]`.
 
 Each `exclude_rules` item requires all given conditions to match.
 All `words` must appear. `pattern` uses JavaScript RegExp with flag `i`.
@@ -126,8 +164,8 @@ Apply rules in this order:
 1. Put away messages from blocked users, service messages, and stickers.
 2. Apply exclude rules, subject to protected words and messages for the owner.
 3. Show muted chats as summaries.
-4. Show messages for the owner, allowed chats, allowed users, and include matches in full.
-5. Show other messages in a group summary.
+4. In `all` mode, show all remaining messages in full.
+5. In `for_me` mode, show messages for the owner, allowed chats, allowed users, and include matches in full. Show other messages in a group summary.
 
 To change rules:
 
@@ -138,13 +176,19 @@ To change rules:
 5. Wait for the owner to clearly agree.
 6. Call `set_filters` with the same fields and `confirm=true`.
 
-Given fields replace saved arrays. Omitted fields keep saved values.
+Given fields replace saved values. Omitted fields keep saved values.
 Pass the full new list, including existing items.
 The preview compares all saved messages with current and proposed rules.
 It says 「按现在已保存的消息算，会多收起 N 条。」 and gives up to three examples.
 A separate 「可能误收的消息（请看一下）：」 block gives up to three new matches
 that have more than 100 characters, contain `?` or `？`, or come from private chats.
 The preview does not save the rule.
+For `default_mode="for_me"`, it says 「以后默认只完整显示给你的消息（私聊、@你、回复你），其他群消息只显示条数。」.
+For `default_mode="all"`, it says 「以后默认显示所有消息的全文。」.
+When the default changes to `for_me` and `owner_names` stays empty, the preview also gives the username hint.
+It tells the owner 「还没有设置你的 Telegram 用户名，@你 的消息可能认不出来。」.
+For added owner names, it says 「以后把『…』当作你的名字：别人 @ 这些名字的消息算给你的。」.
+For removed owner names, it says 「『…』不再当作你的名字。」.
 
 ## Changes need agreement
 
@@ -294,6 +338,7 @@ Call `read_new_messages` after removal to use `getUpdates`.
 Privacy mode is on by default.
 It limits the group messages that the bot can read.
 Bots with admin rights receive all group messages.
-Use BotFather's `/setprivacy` to change privacy mode.
+Turning off privacy mode is required.
+Send `/setprivacy` to BotFather. Select the bot and tap **Disable**.
 Re-add the bot to the group after this change.
 See [Privacy Mode](https://core.telegram.org/bots/features#privacy-mode).

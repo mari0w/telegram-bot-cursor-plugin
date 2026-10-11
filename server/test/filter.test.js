@@ -26,6 +26,7 @@ test("Rule summaries describe only additions and removals with saved names", () 
     ["allow_users", "@Bob", "完整显示 @Bob 发的群消息。", "取消完整显示 @Bob 发的群消息的规则。"],
     ["mute_chats", -1001, "「Ops」只显示新消息条数。", "取消「Ops」只显示新消息条数的规则。"],
     ["allow_chats", "-1001", "「Ops」的消息全部完整显示。", "取消「Ops」的消息全部完整显示的规则。"],
+    ["owner_names", "enoch", "以后把『enoch』当作你的名字：别人 @ 这些名字的消息算给你的。", "『enoch』不再当作你的名字。"],
   ]) {
     const next = { ...empty, [key]: [value] };
     assert.equal(describeFilterChanges(empty, next, chats), added);
@@ -64,7 +65,7 @@ test("Combined exclusions require every condition and keep protected text and me
     ["@MY_BOT 订单", group, {}, { exclude_rules: [{ words: ["订单"] }] }, "full"],
     ["订单 投诉", group, {}, { exclude_keywords: ["订单"], block_users: [9] }, "filtered"],
     ["订单 投诉", group, {}, { exclude_keywords: ["订单"], protected_words: [] }, "filtered"],
-  ]) assert.equal(classify({ ...message, text, ...changes }, chat, rules, owner), expected, text);
+  ]) assert.equal(classify({ ...message, text, ...changes }, chat, rules, owner, "for_me"), expected, text);
 });
 
 const env = { TELEGRAM_BOT_TOKEN: "101:filter-secret", TELEGRAM_BOT_TOKEN_2: "202:filter-secret-two" };
@@ -93,6 +94,7 @@ test("Filter defaults, preview mistakes, pattern validation, and saved results d
     return me;
   });
   assert.deepEqual((await readFilters(store.dir)).protected_words, ["投诉", "退款", "急"]);
+  assert.deepEqual((await readFilters(store.dir)).owner_names, []);
   const texts = ["订单 查单", `订单 查单 ${"长".repeat(101)} ${Object.values(env).join(" ")}`,
     "订单 查单？", "订单 查单 投诉"];
   await store.write({ offset: 0, chats: {
@@ -149,7 +151,7 @@ test("Known business owners are protected in new messages, saved history, and pr
   assert.match(history, /@OWNER 订单/);
   assert.match(history, /订单 reply/);
   const preview = (await call("set_filters", { exclude_rules: [{ words: ["订单"] }] })).content[0].text;
-  assert.match(preview, /会多收起 0 条/);
+  assert.match(preview, /按现在已保存的消息算，没有消息会被收起。/);
   assert.doesNotMatch(preview, /可能误收的消息/);
 });
 
@@ -210,12 +212,92 @@ test("Classify messages in rule order", () => {
     ["allowed username without @", {}, group, { allow_users: ["bob"] }, "full"],
     ["service", { service: true }, group, { allow_chats: [-1001] }, "filtered"],
     ["sticker", { file: { kind: "sticker" } }, { id: 7, type: "private" }, {}, "filtered"],
-  ]) assert.equal(classify({ ...message, ...changes }, chat, rules, me), expected, name);
+  ]) assert.equal(classify({ ...message, ...changes }, chat, rules, me, "for_me"), expected, name);
+});
+
+test("For-me mentions use owner names and Business replies use the owner ID", () => {
+  const owner = { ...me, owner_ids: [1], owner_usernames: ["owner"] };
+  for (const [text, changes, rules, expected] of [
+    ["@enoch 看一下", {}, { owner_names: ["enoch"] }, "full"],
+    ["@enoch 看一下", {}, { owner_names: ["@EnOcH"] }, "full"],
+    ["@enoch 看一下", {}, { owner_names: [] }, "summary"],
+    ["@张三 看一下", {}, { owner_names: ["张三"] }, "full"],
+    ["enoch 看一下", {}, { owner_names: ["enoch"] }, "summary"],
+    ["@OWNER 看一下", {}, { owner_names: [] }, "full"],
+    ["看一下", { reply_to_from_id: 1 }, { owner_names: [] }, "full"],
+    ["看一下", { reply_to_from_id: 9 }, { owner_names: ["Bob"] }, "summary"],
+  ]) assert.equal(classify({ ...message, text, ...changes }, group, rules, owner, "for_me"), expected, text);
+});
+
+test("Owner names need confirmation; empty names add hints for each for-me read and mode preview", async (t) => {
+  let id = 0;
+  const { call, store } = await setup(t, (method) => method === "getMe" ? me : [
+    { update_id: ++id, business_connection: connection },
+    { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "@enoch 看一下" } },
+    { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "回复你",
+      reply_to_message: { message_id: 1, from: { id: 1 } } } },
+  ]);
+  const read = async (args) => (await call("read_new_messages", args)).content[0].text;
+  const hint = "AI: owner_names is empty. Ask the owner in plain words for their Telegram username. "
+    + "Suggested value: @owner. Ask the owner to confirm it, then save it with set_filters (preview first).";
+  const preview = (await call("set_filters", { owner_names: ["enoch"] })).content[0].text;
+  assert.match(preview, /以后把『enoch』当作你的名字：别人 @ 这些名字的消息算给你的。/);
+  assert.deepEqual((await readFilters(store.dir)).owner_names, []);
+  const empty = await read({ mode: "for_me" });
+  assert.doesNotMatch(empty, /@enoch 看一下/);
+  assert.match(empty, /\[group\] Ops .*回复你/);
+  assert.match(empty, /Group summary:\n- Ops .*1 new/);
+  assert.equal(empty.split("\n").at(-1), hint);
+  const modePreview = (await call("set_filters", { default_mode: "for_me" })).content[0].text;
+  assert.match(modePreview, /还没有设置你的 Telegram 用户名，@你 的消息可能认不出来。/);
+  assert.equal(modePreview.split("\n").at(-1), hint);
+  await call("set_filters", { default_mode: "for_me", confirm: true });
+  assert.equal((await read()).split("\n").at(-1), hint);
+  assert.doesNotMatch(await read({ mode: "all" }), /AI: owner_names/);
+  const namesPreview = (await call("set_filters", { default_mode: "all", owner_names: ["enoch"] })).content[0].text;
+  assert.doesNotMatch(namesPreview, /AI: owner_names|还没有设置/);
+  await call("set_filters", { owner_names: ["enoch"], confirm: true });
+  assert.deepEqual(JSON.parse((await call("get_filters")).content[0].text).owner_names, ["enoch"]);
+  const full = await read();
+  assert.match(full, /\[group\] Ops .*@enoch 看一下/);
+  assert.doesNotMatch(full, /AI: owner_names|Group summary/);
+  const invalid = await call("set_filters", { owner_names: [1], confirm: true });
+  assert.equal(invalid.isError, true);
+  assert.deepEqual((await readFilters(store.dir)).owner_names, ["enoch"]);
+  const removal = (await call("set_filters", { owner_names: [] })).content[0].text;
+  assert.match(removal, /『enoch』不再当作你的名字。/);
+  assert.deepEqual((await readFilters(store.dir)).owner_names, ["enoch"]);
+});
+
+test("Empty for-me reads ask for names without a Business username suggestion", () => {
+  const hint = "AI: owner_names is empty. Ask the owner in plain words for their Telegram username. "
+    + "Ask the owner to confirm it, then save it with set_filters (preview first).";
+  const args = { bot_id: 101, messages: [], rules: { default_mode: "for_me" }, me: { owner_ids: [1] }, more: true };
+  const output = formatMessages(args);
+  assert.match(output, /^bot 101: no new messages\.\nMore updates are waiting\./);
+  assert.equal(output.split("\n").at(-1), hint);
+  assert.doesNotMatch(output, /Suggested value/);
+  assert.doesNotMatch(formatMessages({ ...args, rules: { owner_names: ["enoch"] }, mode: "for_me" }), /AI:/);
+  assert.doesNotMatch(formatMessages({ ...args, mode: "all" }), /AI:/);
+});
+
+test("Owner name previews and Business username hints redact tokens", async (t) => {
+  const { call, store } = await setup(t, (method) => method === "getMe" ? me : []);
+  const state = { offset: 0, chats: {} };
+  addBusinessConnection(state, { ...connection, user: { id: 1, username: env.TELEGRAM_BOT_TOKEN } });
+  await store.write(state);
+  const names = (await call("set_filters", { owner_names: [env.TELEGRAM_BOT_TOKEN_2] })).content[0].text;
+  assert.match(names, /以后把『\[REDACTED\]』当作你的名字/);
+  const preview = (await call("set_filters", { default_mode: "for_me" })).content[0].text;
+  assert.match(preview, /Suggested value: @\[REDACTED\]/);
+  const read = (await call("read_new_messages", { mode: "for_me" })).content[0].text;
+  assert.match(read, /no new messages/);
+  assert.match(read, /Suggested value: @\[REDACTED\]/);
 });
 
 test("Format compact lines, summaries, and filtered counts", () => {
   const privateChat = { id: 7, type: "private", first_name: "Alice", last_name: "Smith" };
-  const output = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, more: true,
+  const output = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, more: true, mode: "for_me",
     chats: { 7: { chat: privateChat }, [-1001]: { chat: group } }, messages: [
       { ...message, chat_id: 7, text: "a".repeat(501), edited: true,
         reply_to_message_id: 44, file: { kind: "document", file_name: "file.pdf" } },
@@ -232,10 +314,76 @@ test("Format compact lines, summaries, and filtered counts", () => {
   assert.doesNotMatch(output, /group text/);
   assert.match(output, /已收起 1 条。Call get_chat_messages with show_filtered=true to view them\./);
   assert.match(output, /More updates are waiting\. Call read_new_messages again\./);
-  const all = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, all: true,
+  const all = formatMessages({ bot_id: 101, offset: 120, me, rules: {}, mode: "all",
     chats: { [-1001]: { chat: group } }, messages: [{ ...message, service: true }, message] });
   assert.equal(all.split("\n").length, 3);
-  assert.match(all, /@Bob: \[service message\] hello/);
-  assert.doesNotMatch(all, /Group summary|已收起/);
+  assert.match(all, /@Bob: hello/);
+  assert.match(all, /已收起 1 条/);
+  assert.doesNotMatch(all, /Group summary|service message/);
   assert.equal(formatMessages({ bot_id: 101, messages: [] }), "bot 101: no new messages.");
+});
+
+test("Read modes keep muted summaries and change the saved default only after confirmation", async (t) => {
+  const muted = { id: -1002, type: "group", title: "Muted" };
+  let id = 0;
+  const { call, store } = await setup(t, (method) => method === "getMe" ? me : [
+    { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "plain group message" } },
+    { update_id: ++id, message: { message_id: id, date: id, chat: muted, text: "muted message" } },
+  ]);
+  await call("set_filters", { mute_chats: [muted.id], confirm: true });
+  const read = async (args) => (await call("read_new_messages", args)).content[0].text;
+  const full = await read();
+  assert.match(full, /\[group\] Ops .*plain group message/);
+  assert.match(full, /Group summary:\n- Muted .*1 new/);
+  assert.doesNotMatch(full, /muted message|\n- Ops/);
+  const forMe = await read({ mode: "for_me" });
+  assert.match(forMe, /Group summary:\n- Ops .*1 new.*\n- Muted .*1 new/);
+  assert.doesNotMatch(forMe, /plain group message|muted message/);
+  const preview = (await call("set_filters", { default_mode: "for_me" })).content[0].text;
+  assert.match(preview, /^以后默认只完整显示给你的消息（私聊、@你、回复你），其他群消息只显示条数。/);
+  assert.equal((await readFilters(store.dir)).default_mode, "all");
+  assert.match(await read(), /plain group message/);
+  await call("set_filters", { default_mode: "for_me", confirm: true });
+  assert.equal(JSON.parse((await call("get_filters")).content[0].text).default_mode, "for_me");
+  assert.doesNotMatch(await read(), /plain group message/);
+  assert.match(await read({ mode: "all" }), /plain group message/);
+  assert.match((await call("set_filters", { default_mode: "all" })).content[0].text,
+    /^以后默认显示所有消息的全文。/);
+});
+
+test("Message context shows the original reply and nearby saved messages with filters", async (t) => {
+  const { call, store } = await setup(t, (method) => {
+    assert.equal(method, "getMe");
+    return me;
+  });
+  const messages = Array.from({ length: 15 }, (_, i) => ({ ...message, message_id: i + 1,
+    text: i === 0 ? `Original ${Object.values(env).join(" ")}` : i === 3 ? "hidden" : `Message ${i + 1}`,
+    ...(i === 7 ? { reply_to_message_id: 1 } : {}),
+  }));
+  await store.write({ offset: 0, chats: {
+    [group.id]: { chat: group, messages: [...messages].reverse() },
+    7: { chat: { id: 7, type: "private" }, messages: [{ ...message, message_id: 1, text: "Other chat" }] },
+  } });
+  await call("set_filters", { exclude_keywords: ["hidden"], confirm: true });
+  const read = async (args = {}) => (await call("get_chat_messages", {
+    chat_id: group.id, message_id: 8, limit: 1, before_message_id: 3, ...args,
+  })).content[0].text;
+  const ids = (text) => [...text.matchAll(/ #(\d+) /g)].map((match) => Number(match[1]));
+  const output = await read();
+  assert.match(output, /^原消息：\[group\] Ops .*Original \[REDACTED\] \[REDACTED\]/);
+  assert.deepEqual(ids(output), [1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  assert.match(output, /\n→ \[group\] Ops .*#8 .*Message 8/);
+  assert.match(output, /已收起 1 条/);
+  assert.doesNotMatch(output, /hidden|Other chat/);
+  assert.deepEqual(ids(await read({ context: 1 })), [1, 7, 8, 9]);
+  assert.doesNotMatch(await read({ context: 7, show_filtered: true }), /原消息：/);
+  assert.deepEqual(ids(await read({ show_filtered: true })), [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  await call("set_filters", { exclude_keywords: ["Original"], confirm: true });
+  assert.doesNotMatch(await read({ context: 0 }), /原消息：|Original/);
+  assert.match(await read({ context: 0, show_filtered: true }), /^原消息：/);
+  messages[7].reply_to_message_id = 99;
+  await store.write({ offset: 0, chats: { [group.id]: { chat: group, messages } } });
+  const missing = await read({ context: 0 });
+  assert.match(missing, /^原消息没有保存在本地。\n→ /);
+  assert.deepEqual(ids(missing), [8]);
 });

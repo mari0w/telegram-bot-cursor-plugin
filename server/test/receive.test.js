@@ -102,7 +102,7 @@ test("Receive omits stale or unknown offsets and saves the last update time only
   const store = openStore(dataDir, 101);
   for (const last_update_at of [now - 6 * 24 * 60 * 60 - 1, now - 6 * 24 * 60 * 60,
     undefined, now - 6 * 24 * 60 * 60 + 1]) {
-    const state = { offset: 100, chats: {}, ...(last_update_at === undefined ? {} : { last_update_at }) };
+    const state = { offset: 100, chats: {}, pending: [], ...(last_update_at === undefined ? {} : { last_update_at }) };
     await store.write(state);
     updates = [];
     await call("read_new_messages");
@@ -121,17 +121,106 @@ test("Receive omits stale or unknown offsets and saves the last update time only
   }
 });
 
-test("Receive keeps the last 200 messages per chat and reports full batches", async (t) => {
-  let id = 0;
-  const { call, dataDir } = await setup(t, () => ({ ok: true,
-    result: Array.from({ length: id < 200 ? 100 : 5 }, () => update(++id)) }));
-  assert.match(await call("read_new_messages"), /More updates are waiting/);
-  await call("read_new_messages");
-  assert.doesNotMatch(await call("read_new_messages"), /More updates are waiting/);
+test("Receive stores 250 updates in three batches and saves each offset before the next fetch", async (t) => {
+  let batch = 0;
+  const { call, calls, dataDir } = await setup(t, async () => {
+    const saved = await openStore(dataDir, 101).read();
+    assert.equal(saved.offset, batch === 0 ? 0 : batch * 100 + 1);
+    assert.equal(saved.pending.length, batch * 100);
+    const start = batch++ * 100;
+    return { ok: true, result: Array.from({ length: start < 200 ? 100 : 50 }, (_, i) => update(start + i + 1)) };
+  });
+  const output = await call("read_new_messages", { timeout: 2, limit: 1000 });
+  assert.match(output, /250 new messages\. offset 251\./);
+  assert.doesNotMatch(output, /More updates are waiting|还有/);
+  assert.deepEqual(calls.map(({ params }) => params), [0, 101, 201].map((offset, i) =>
+    ({ offset, timeout: i === 0 ? 2 : 0, limit: 100, allowed_updates })));
   const saved = await openStore(dataDir, 101).read();
-  assert.equal(saved.chats[7].messages.length, 200);
-  assert.equal(saved.chats[7].messages[0].message_id, 6);
-  assert.equal(saved.chats[7].messages.at(-1).message_id, 205);
+  assert.equal(saved.offset, 251);
+  assert.deepEqual(saved.chats[7].messages.map((message) => message.message_id),
+    Array.from({ length: 250 }, (_, i) => i + 1));
+  assert.deepEqual(saved.pending, []);
+});
+
+test("Receive shows 150 pending messages in two pages with no repeats", async (t) => {
+  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
+  const store = openStore(dataDir, 101);
+  const state = await store.read();
+  addUpdates(state, Array.from({ length: 150 }, (_, i) => {
+    const item = update(i + 1, i < 120 ? -1002 : -1003);
+    item.message.chat = { id: item.message.chat.id, type: "group", title: i < 120 ? "销售群" : "运营群" };
+    return item;
+  }));
+  await store.write(state);
+  const first = await call("read_new_messages", { limit: 100 });
+  assert.match(first, /100 new messages/);
+  assert.match(first, /还有 50 条没显示。再次调用 read_new_messages 显示下一批，或用 get_chat_messages 查看某个群。/);
+  assert.match(first, /- 销售群 \(chat -1002\): 还有 20 条/);
+  assert.match(first, /- 运营群 \(chat -1003\): 还有 30 条/);
+  assert.equal((await store.read()).pending.length, 50);
+  const second = await call("read_new_messages", { limit: 100 });
+  assert.match(second, /50 new messages/);
+  assert.doesNotMatch(second, /还有/);
+  const ids = (text) => [...text.matchAll(/\) #(\d+) /g)].map((match) => Number(match[1]));
+  assert.deepEqual(ids(first), Array.from({ length: 100 }, (_, i) => i + 1));
+  assert.deepEqual(ids(second), Array.from({ length: 50 }, (_, i) => i + 101));
+  assert.equal(new Set([...ids(first), ...ids(second)]).size, 150);
+  assert.deepEqual((await store.read()).pending, []);
+  assert.equal(calls.length, 2);
+});
+
+test("Receive stops after 20 full batches and keeps messages for the next page", async (t) => {
+  let id = 0;
+  const { call, calls, dataDir } = await setup(t, () => ({ ok: true,
+    result: Array.from({ length: 100 }, () => update(++id)) }));
+  const output = await call("read_new_messages");
+  assert.match(output, /200 new messages\. offset 2001\./);
+  assert.match(output, /More updates are waiting\. Call read_new_messages again\./);
+  assert.match(output, /还有 1800 条没显示/);
+  assert.equal(calls.length, 20);
+  const saved = await openStore(dataDir, 101).read();
+  assert.equal(saved.chats[7].messages.length, 2000);
+  assert.equal(saved.pending.length, 1800);
+});
+
+test("Pending edits keep their place; owner messages stay out and deleted messages are skipped", async (t) => {
+  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
+  const store = openStore(dataDir, 101);
+  const state = await store.read();
+  const business = (id, from = 9) => ({ ...update(id).message, business_connection_id: "conn", from: { id: from } });
+  addUpdates(state, [
+    { update_id: 1, business_connection: { id: "conn", user: { id: 1 } } },
+    { update_id: 2, business_message: business(1) },
+    { update_id: 3, business_message: business(2) },
+    { update_id: 4, business_message: business(3, 1) },
+    update(5),
+    { update_id: 6, edited_business_message: { ...business(1), text: "Updated text" } },
+    { update_id: 7, deleted_business_messages: {
+      business_connection_id: "conn", chat: { id: 7 }, message_ids: [2],
+    } },
+  ]);
+  assert.deepEqual(state.pending, [["conn:7", 1], ["conn:7", 2], ["7", 5]]);
+  await store.write(state);
+  const output = await call("read_new_messages", { limit: 1 });
+  assert.match(output, /1 new messages/);
+  assert.match(output, /\(edited\).*Updated text/);
+  assert.doesNotMatch(output, /#2 |#3 /);
+  assert.match(output, /还有 1 条没显示/);
+  assert.deepEqual((await store.read()).pending, [["7", 5]]);
+  const next = await call("read_new_messages", { limit: 1 });
+  assert.match(next, /#5 /);
+  assert.doesNotMatch(next, /Updated text|还有/);
+  assert.deepEqual((await store.read()).pending, []);
+});
+
+test("Store keeps the last 2000 messages per chat", () => {
+  const state = { offset: 0, chats: {}, pending: [] };
+  addUpdates(state, Array.from({ length: 2050 }, (_, i) => update(i + 1)));
+  addUpdates(state, [update(2051, 8)]);
+  assert.equal(state.chats[7].messages.length, 2000);
+  assert.equal(state.chats[7].messages[0].message_id, 51);
+  assert.equal(state.chats[7].messages.at(-1).message_id, 2050);
+  assert.equal(state.chats[8].messages.length, 1);
 });
 
 test("Local tools list seen chats and select recent messages without fetch", async (t) => {
@@ -165,10 +254,12 @@ test("Message filters return compact text, need confirmation, and do not leak to
   const file = path.join(dataDir, "101/filters.json");
   const current = await call("get_filters");
   assert.deepEqual(current.protected_words, ["投诉", "退款", "急"]);
-  assert.ok(Object.entries(current).every(([key, value]) => Array.isArray(value) && (key === "protected_words" || !value.length)));
+  assert.equal(current.default_mode, "all");
+  assert.ok(Object.entries(current).filter(([key]) => key !== "default_mode")
+    .every(([key, value]) => Array.isArray(value) && (key === "protected_words" || !value.length)));
   const preview = await call("set_filters", { exclude_keywords: ["订单"] });
   assert.match(preview, /以后包含『订单』的消息不再显示给你。/);
-  assert.match(preview, /按现在已保存的消息算，会多收起 0 条。/);
+  assert.match(preview, /按现在已保存的消息算，没有消息会被收起。/);
   assert.match(preview, /要保存这条规则吗？\nAI: Show the text above to the owner.*confirm=true only after the owner clearly agrees/);
   assert.doesNotMatch(preview, /regex|JSON|chat_id/);
   await assert.rejects(readFile(file), { code: "ENOENT" });
@@ -185,10 +276,9 @@ test("Message filters return compact text, need confirmation, and do not leak to
 
   const output = await call("read_new_messages");
   assert.match(output, /\[private\] Alice \(chat 7\) #1 2026-10-11 02:05Z Alice: hello \[REDACTED\]/);
-  assert.match(output, /Group summary:\n- Ops \(chat -1001\): 1 new, last 2026-10-11 02:30Z/);
-  assert.doesNotMatch(output, /已收起/);
+  assert.match(output, /\[group\] Ops \(chat -1001\) #2 2026-10-11 02:30Z group content/);
+  assert.doesNotMatch(output, /Group summary|已收起/);
   assert.match(output, /订单 hidden content/);
-  assert.doesNotMatch(output, /group content/);
   const store = openStore(dataDir, 101);
   const state = await store.read();
   assert.equal(state.chats[7].messages.length, 2);
@@ -203,7 +293,7 @@ test("Message filters return compact text, need confirmation, and do not leak to
   assert.match(shown, /订单 hidden content/);
   assert.doesNotMatch(shown, /已收起 \d/);
   assert.match(await call("get_chat_messages", { chat_id: -1001 }), /group content/);
-  const all = await call("read_new_messages", { all: true });
+  const all = await call("read_new_messages", { mode: "all" });
   assert.match(all, /group content/);
   assert.match(all, /订单 hidden content/);
   assert.doesNotMatch(all, /Group summary|已收起/);
@@ -241,8 +331,8 @@ test("Filter previews classify all saved chats, cap examples, and never save wit
     assert.equal(await call("set_filters", { exclude_rules, confirm }), "规则没有变化。");
     assert.equal((await stat(file)).mtimeMs, saved.mtimeMs);
   }
-  assert.match(await call("set_filters", { exclude_rules: [] }), /取消同时包含『订单』的消息不再显示给你的规则。\n按现在已保存的消息算，会多收起 0 条。会少收起 4 条。/);
-  assert.match(await call("set_filters", { include_keywords: ["keep"] }), /会多收起 0 条/);
+  assert.match(await call("set_filters", { exclude_rules: [] }), /取消同时包含『订单』的消息不再显示给你的规则。\n按现在已保存的消息算，没有消息会被收起。会少收起 4 条。/);
+  assert.match(await call("set_filters", { include_keywords: ["keep"] }), /没有消息会被收起/);
   assert.deepEqual(JSON.parse(await readFile(file, "utf8")).exclude_rules, exclude_rules);
   await call("set_filters", { exclude_rules: [], confirm: true });
   assert.deepEqual((await call("get_filters")).exclude_rules, []);
@@ -286,11 +376,11 @@ test("409 errors are redacted and point to webhook tools; the lock is released",
   assert.match(result.content[0].text, /409 Conflict.*get_webhook_info.*delete_webhook with confirm=true/);
   assert.match(result.content[0].text, /Telegram API getUpdates failed: 409 Conflict \[REDACTED\]/);
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {} });
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });
 
 test("Channel edits, captions, and each file kind use short fields", () => {
-  const state = { offset: 0, chats: {} };
+  const state = { offset: 0, chats: {}, pending: [] };
   const kinds = ["document", "video", "audio", "voice", "animation", "sticker", "video_note"];
   const messages = addUpdates(state, kinds.map((kind, i) => ({ update_id: i, channel_post: {
     message_id: i, date: i, chat: { id: -1, type: "channel", title: "News" }, caption: "Caption",

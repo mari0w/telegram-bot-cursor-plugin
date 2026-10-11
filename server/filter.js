@@ -3,12 +3,13 @@ import path from "node:path";
 import { chatKey } from "./store.js";
 
 export const filterFields = ["allow_chats", "mute_chats", "exclude_keywords", "include_keywords",
-  "exclude_regex", "include_regex", "allow_users", "block_users", "exclude_rules", "protected_words"];
+  "exclude_regex", "include_regex", "allow_users", "block_users", "exclude_rules", "protected_words", "owner_names"];
 const protectedWords = ["投诉", "退款", "急"];
 
 export async function readFilters(dir) {
   const defaults = Object.fromEntries(filterFields.map((key) => [key, []]));
   defaults.protected_words = [...protectedWords];
+  defaults.default_mode = "all";
   try {
     return { ...defaults, ...JSON.parse(await readFile(path.join(dir, "filters.json"), "utf8")) };
   } catch (error) {
@@ -24,7 +25,7 @@ export async function writeFilters(dir, rules) {
   await rename(temp, path.join(dir, "filters.json"));
 }
 
-export function classify(message, chat, rules, me = {}) {
+export function classify(message, chat, rules, me = {}, mode = rules.default_mode ?? "all") {
   const text = message.text ?? "";
   const lower = text.toLowerCase();
   const hasChat = (items) => items.some((id) => String(id) === chatKey(chat.id, message.business_connection_id));
@@ -34,6 +35,8 @@ export function classify(message, chat, rules, me = {}) {
   const matches = (prefix) => (rules[`${prefix}_keywords`] ?? []).some((word) => lower.includes(word.toLowerCase()))
     || (rules[`${prefix}_regex`] ?? []).some((source) => new RegExp(source, "i").test(text));
   const forMe = chat.type === "private"
+    || (rules.owner_names ?? []).map((name) => name.replace(/^@/, "").toLowerCase())
+      .some((name) => name && lower.includes(`@${name}`))
     || [me.username, ...(me.owner_usernames ?? [])].some((name) => name && lower.includes(`@${name.toLowerCase()}`))
     || (message.reply_to_from_id !== undefined && [me.id, ...(me.owner_ids ?? [])]
       .some((id) => id !== undefined && String(message.reply_to_from_id) === String(id)));
@@ -48,7 +51,7 @@ export function classify(message, chat, rules, me = {}) {
     && (rule.chats === undefined || hasChat(rule.chats))
     && (rule.users === undefined || hasUser(rule.users))))) return "filtered";
   if (hasChat(rules.mute_chats ?? [])) return "summary";
-  if (forMe || hasChat(rules.allow_chats ?? []) || hasUser(rules.allow_users ?? []) || matches("include")) return "full";
+  if (mode === "all" || forMe || hasChat(rules.allow_chats ?? []) || hasUser(rules.allow_users ?? []) || matches("include")) return "full";
   return "summary";
 }
 
@@ -97,8 +100,18 @@ export function describeFilterChanges(current, next, chats) {
       (items) => items.map((rule) => `取消${ruleText(rule)}不再显示给你的规则`).join("。")],
     protected_words: [(items) => items.map((word) => `包含『${word}』的消息一定显示给你`).join("。"),
       (items) => items.map((word) => `『${word}』不再是一定显示的词`).join("。")],
+    owner_names: [(items) => `以后把${words(items)}当作你的名字：别人 @ 这些名字的消息算给你的`,
+      (items) => `${words(items)}不再当作你的名字`],
   };
   const lines = [];
+  if ((current.default_mode ?? "all") !== (next.default_mode ?? "all")) {
+    lines.push(next.default_mode === "for_me"
+      ? "以后默认只完整显示给你的消息（私聊、@你、回复你），其他群消息只显示条数。"
+      : "以后默认显示所有消息的全文。");
+    if (next.default_mode === "for_me" && !next.owner_names?.length) {
+      lines.push("还没有设置你的 Telegram 用户名，@你 的消息可能认不出来。");
+    }
+  }
   const same = (a, b) => typeof a === "object" || typeof b === "object"
     ? JSON.stringify(a) === JSON.stringify(b) : String(a) === String(b);
   for (const key of filterFields) {
@@ -132,7 +145,7 @@ export function previewFilterImpact(current, next, chats, me) {
       }
     }
   }
-  return `按现在已保存的消息算，会多收起 ${hidden} 条。`
+  return (hidden ? `按现在已保存的消息算，会多收起 ${hidden} 条。` : "按现在已保存的消息算，没有消息会被收起。")
     + (restored ? `会少收起 ${restored} 条。` : "")
     + (examples.length ? `\n例如：\n${examples.join("\n")}` : "")
     + (possibleMistakes.length ? `\n\n可能误收的消息（请看一下）：\n${possibleMistakes.join("\n")}` : "");
@@ -148,17 +161,27 @@ export function formatMessage(message, chat) {
     + `${text ? ` ${text.length > 500 ? text.slice(0, 500) + "…" : text}` : ""}`;
 }
 
-export function formatMessages({ bot_id, messages, chats, rules, me, offset, more = false, all = false }) {
+export function ownerNamesHint(rules, me, mode = rules.default_mode ?? "all") {
+  if (mode !== "for_me" || rules.owner_names?.length) return "";
+  const username = me.owner_usernames?.[0];
+  return "AI: owner_names is empty. Ask the owner in plain words for their Telegram username. "
+    + (username ? `Suggested value: @${username}. ` : "")
+    + "Ask the owner to confirm it, then save it with set_filters (preview first).";
+}
+
+export function formatMessages({ bot_id, messages, chats, rules = {}, me = {}, offset, more = false, mode, pending = [] }) {
+  const hint = ownerNamesHint(rules, me, mode);
   messages = messages.filter((message) => !message.outgoing);
   if (!messages.length) return `bot ${bot_id}: no new messages.`
-    + (more ? "\nMore updates are waiting. Call read_new_messages again." : "");
+    + (more ? "\nMore updates are waiting. Call read_new_messages again." : "")
+    + (hint ? `\n${hint}` : "");
   const lines = [`bot ${bot_id}: ${messages.length} new messages. offset ${offset}.`];
   const summaries = new Map();
   let filtered = 0;
   for (const message of messages) {
     const key = chatKey(message.chat_id, message.business_connection_id);
     const chat = chats[key].chat;
-    const kind = all ? "full" : classify(message, chat, rules, me);
+    const kind = classify(message, chat, rules, me, mode);
     if (kind === "full") lines.push(formatMessage(message, chat));
     else if (kind === "filtered") filtered++;
     else {
@@ -177,5 +200,14 @@ export function formatMessages({ bot_id, messages, chats, rules, me, offset, mor
   }
   if (filtered) lines.push(`已收起 ${filtered} 条。Call get_chat_messages with show_filtered=true to view them.`);
   if (more) lines.push("More updates are waiting. Call read_new_messages again.");
+  if (pending.length) {
+    lines.push(`还有 ${pending.length} 条没显示。再次调用 read_new_messages 显示下一批，或用 get_chat_messages 查看某个群。`);
+    const counts = new Map();
+    for (const [key] of pending) counts.set(key, (counts.get(key) ?? 0) + 1);
+    for (const [key, count] of counts) {
+      lines.push(`- ${chatName(chats[key].chat)} (chat ${key}): 还有 ${count} 条`);
+    }
+  }
+  if (hint) lines.push(hint);
   return lines.join("\n");
 }

@@ -2,6 +2,7 @@ import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 
+const CHAT_MESSAGE_LIMIT = 2000;
 const pick = (obj, fields) => Object.fromEntries(fields.filter((key) => obj[key] !== undefined)
   .map((key) => [key, obj[key]]));
 
@@ -14,9 +15,11 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
     dir,
     async read() {
       try {
-        return JSON.parse(await readFile(file, "utf8"));
+        const state = JSON.parse(await readFile(file, "utf8"));
+        state.pending ??= [];
+        return state;
       } catch (error) {
-        if (error.code === "ENOENT") return { offset: 0, chats: {} };
+        if (error.code === "ENOENT") return { offset: 0, chats: {}, pending: [] };
         throw error;
       }
     },
@@ -61,7 +64,8 @@ export function addBusinessConnection(store, connection) {
 
 export function addMessage(store, source, { update_id, edited = false, outgoing = false } = {}) {
   const id = source.business_connection_id;
-  const entry = store.chats[chatKey(source.chat.id, id)] ??= { chat: {}, messages: [] };
+  const key = chatKey(source.chat.id, id);
+  const entry = store.chats[key] ??= { chat: {}, messages: [] };
   if (update_id !== undefined && entry.messages.some((message) => message.update_id === update_id)) return;
   entry.chat = pick(source.chat, ["id", "type", "title", "username", "first_name", "last_name"]);
   const message = { ...pick({ update_id }, ["update_id"]), ...pick(source, ["message_id", "date", "edit_date"]),
@@ -90,7 +94,12 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
   const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
   if (index === -1) entry.messages.push(message);
   else entry.messages[index] = message;
-  entry.messages = entry.messages.slice(-200);
+  entry.messages = entry.messages.slice(-CHAT_MESSAGE_LIMIT);
+  store.pending ??= [];
+  if (!outgoing && !message.outgoing
+    && !store.pending.some(([chat, message_id]) => chat === key && message_id === message.message_id)) {
+    store.pending.push([key, message.message_id]);
+  }
   return message;
 }
 

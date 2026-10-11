@@ -10,9 +10,10 @@ import { businessStatus, loadBots, selectBot } from "./bots.js";
 import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
 import { addBusinessConnection, addMessage, addUpdates, openStore } from "./store.js";
 import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages,
-  previewFilterImpact, readFilters, writeFilters } from "./filter.js";
+  ownerNamesHint, previewFilterImpact, readFilters, writeFilters } from "./filter.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
+const UPDATE_CALL_LIMIT = 20;
 const RATE_REMINDER = "Reminder: Telegram limits: in one chat, avoid more than 1 message per second; in one group, no more than 20 messages per minute; for bulk notifications, about 30 messages per second at most. Over the limit, Telegram returns 429 with retry_after. Bots that share one token share these limits.";
 
 function textResult(obj, tokens = []) {
@@ -105,7 +106,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
             if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== message_id);
           } else {
             addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)),
-              { edited: method === "editMessageText", outgoing: !!params.business_connection_id });
+              { edited: method === "editMessageText", outgoing: true });
           }
           await store.write(state);
         });
@@ -247,28 +248,43 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       return errorResult(error, tokens);
     }
   });
-  server.tool("read_new_messages", "Read new messages once and save them. Filtering uses local fixed rules. By default, show full text for private chats, bot and owner @mentions, and replies to the bot or owner. Protected words stop exclusions. Messages for the owner are kept unless an exclude_rules item has include_for_me=true. Show allowed chats, allowed users, and include matches in full. Muted chats show a summary. Show other group messages as one summary line per group. Count messages that are put away only. Set all=true to show all incoming messages. Owner messages in business chats are saved as context only. Never mark messages as read. Telegram keeps updates for 24 hours only.", {
-    bot: botSchema, timeout: z.number().int().min(0).max(50).default(0), all: z.boolean().default(false),
-  }, async ({ bot, timeout, all }) => {
+  server.tool("read_new_messages", "Fetch and save new updates in batches of 100, up to 20 calls. Show the next page of saved incoming messages. Set limit from 1 to 1000 (default 200). Only the first fetch uses timeout. Call again while updates or saved messages are waiting. Omit mode to use the saved default_mode (initially all). Mode all shows every readable incoming message in full. Mode for_me shows private chats, bot and owner @mentions and replies, allowed chats, allowed users, and include matches in full. Other group messages show one summary line per group. Both modes apply local filters and the 500-character cut. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept unless an exclude_rules item has include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only. Never mark messages as read. Telegram keeps updates for 24 hours only.", {
+    bot: botSchema, timeout: z.number().int().min(0).max(50).default(0),
+    limit: z.number().int().min(1).max(1000).default(200),
+    mode: z.enum(["all", "for_me"]).optional(),
+  }, async ({ bot, timeout, limit, mode }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
       return await store.withLock(async () => {
         const state = await store.read();
-        const me = await filterMe(entry, state);
+        await getUsername(entry);
         const resetOffset = state.last_update_at === undefined ? state.offset > 0
           : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
-        const updates = await callApi(entry.token, "getUpdates", {
-          ...(resetOffset ? {} : { offset: state.offset }), timeout, limit: 100,
-          allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
-            "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
-        },
-          { fetch, env, timeoutMs: (timeout + 10) * 1000 });
-        const messages = addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
-        await store.write(state);
+        let more = false;
+        for (let batch = 0; batch < UPDATE_CALL_LIMIT; batch++) {
+          const wait = batch === 0 ? timeout : 0;
+          const updates = await callApi(entry.token, "getUpdates", {
+            ...(batch === 0 && resetOffset ? {} : { offset: state.offset }), timeout: wait, limit: 100,
+            allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
+              "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+          }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
+          addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
+          await store.write(state);
+          more = updates.length === 100;
+          if (!more) break;
+        }
+        state.pending = state.pending.filter(([key, id]) =>
+          state.chats[key]?.messages.some((message) => message.message_id === id));
+        const messages = state.pending.slice(0, limit).map(([key, id]) =>
+          state.chats[key].messages.find((message) => message.message_id === id));
+        const me = await filterMe(entry, state);
         const rules = await readFilters(store.dir);
-        return plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
-          offset: state.offset, more: updates.length === 100, all }), tokens);
+        const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
+          offset: state.offset, more, mode, pending: state.pending.slice(limit) }), tokens);
+        state.pending.splice(0, limit);
+        await store.write(state);
+        return result;
       });
     } catch (error) {
       if (error.code === 409) {
@@ -278,23 +294,40 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     }
   });
 
-  server.tool("get_chat_messages", "Read saved messages for one chat. Return compact text with the oldest message first. Hide filtered messages by default. Set show_filtered=true to view them.", {
+  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
     bot: botSchema, chat_id: z.union([z.string(), z.number()]),
     limit: z.number().int().min(1).max(200).default(20), before_message_id: z.number().int().optional(),
+    message_id: z.number().int().optional(), context: z.number().int().min(0).max(50).default(5),
     show_filtered: z.boolean().default(false),
-  }, async ({ bot, chat_id, limit, before_message_id, show_filtered }) => {
+  }, async ({ bot, chat_id, limit, before_message_id, message_id, context, show_filtered }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
       const state = await store.read();
       const rules = await readFilters(store.dir);
       const chat = state.chats[chat_id];
-      const messages = (chat?.messages ?? []).filter((message) =>
-        before_message_id === undefined || message.message_id < before_message_id)
-        .sort((a, b) => a.message_id - b.message_id).slice(-limit);
+      const saved = (chat?.messages ?? []).slice().sort((a, b) => a.message_id - b.message_id);
+      let messages;
+      const lines = [];
+      if (message_id !== undefined) {
+        const index = saved.findIndex((message) => message.message_id === message_id);
+        messages = index === -1 ? [] : saved.slice(Math.max(0, index - context), index + context + 1)
+          .map((message) => ({ message, prefix: message.message_id === message_id ? "→ " : "" }));
+        const replyId = saved[index]?.reply_to_message_id;
+        if (replyId !== undefined) {
+          const original = saved.find((message) => message.message_id === replyId);
+          if (!original) lines.push("原消息没有保存在本地。");
+          else if (!messages.some(({ message }) => message.message_id === replyId)) {
+            messages.unshift({ message: original, prefix: "原消息：" });
+          }
+        }
+      } else {
+        messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
+          .slice(-limit).map((message) => ({ message, prefix: "" }));
+      }
       const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
-      const visible = messages.filter((message) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
-      const lines = visible.map((message) => formatMessage(message, chat.chat));
+      const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
+      lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
       if (!lines.length) lines.push("No saved messages.");
       const hidden = messages.length - visible.length;
       if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
@@ -315,6 +348,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
 
   server.tool("set_filters", "The owner must approve every add, change, or delete of a rule. Call without confirm first. Show the preview text to the owner as is. Point out the messages that might be hidden by mistake. Call with confirm=true only after the owner clearly agrees. Never add rules on your own. Read real saved messages with get_chat_messages first. Use specific rules: require several words or limit a rule to a chat or sender. Talk to the owner in everyday language. Do not mention technical words (regex, JSON, chat_id, file paths). Given fields replace saved fields. Omitted fields keep their saved value. Call get_filters first and pass the full new list. Protected words and messages for the owner are kept by default.", {
     bot: botSchema, confirm: z.boolean().default(false),
+    default_mode: z.enum(["all", "for_me"]).optional(),
     ...Object.fromEntries(filterFields.filter((key) => key !== "exclude_rules").map((key) => [key, z.array(key.endsWith("chats") || key.endsWith("users")
       ? z.union([z.string(), z.number()]) : z.string()).optional()])),
     exclude_rules: z.array(z.object({ words: z.array(z.string()).optional(), pattern: z.string().optional(),
@@ -335,8 +369,10 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       if (!summary) return plainTextResult("规则没有变化。", tokens);
       if (!confirm) {
         const me = await filterMe(entry, state);
+        const hint = (current.default_mode ?? "all") !== next.default_mode ? ownerNamesHint(next, me) : "";
         return plainTextResult(`${summary}\n${previewFilterImpact(current, next, chats, me)}\n要保存这条规则吗？\n`
-          + "AI: Show the text above to the owner. Call again with confirm=true only after the owner clearly agrees. Do not add rules by yourself. Point out the messages that might be hidden by mistake.", tokens);
+          + "AI: Show the text above to the owner. Call again with confirm=true only after the owner clearly agrees. Do not add rules by yourself. Point out the messages that might be hidden by mistake."
+          + (hint ? `\n${hint}` : ""), tokens);
       }
       await writeFilters(store.dir, next);
       return plainTextResult(`已保存。\n${summary}\n如果有消息被误收，直接告诉我，我再改规则（改之前也会先问你）。`, tokens);

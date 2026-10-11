@@ -71,7 +71,7 @@ test("A getMe failure on the first read leaves the offset unchanged and does not
     ? { ok: false, error_code: 401, description: "Unauthorized" }
     : { ok: true, result: [{ update_id: 10, message: message(10) }] });
   const store = openStore(dataDir, 101);
-  const state = { offset: 7, last_update_at: Math.floor(Date.now() / 1000), chats: {} };
+  const state = { offset: 7, last_update_at: Math.floor(Date.now() / 1000), chats: {}, pending: [] };
   await store.write(state);
   const result = await call("read_new_messages");
   assert.equal(result.isError, true);
@@ -99,6 +99,7 @@ test("Send maps reply parameters and saves both sides of the chat", async (t) =>
   const saved = (await openStore(dataDir, 101).read()).chats[7];
   assert.deepEqual(saved.messages.map(({ text, from }) => [text, from.is_bot]), [["Incoming", false], [sent.text, true]]);
   assert.equal((await openStore(dataDir, 101).read()).offset, 2);
+  assert.deepEqual((await openStore(dataDir, 101).read()).pending, []);
 });
 
 test("Edit replaces saved text and delete removes the saved message", async (t) => {
@@ -150,7 +151,7 @@ test("Bot 202 uses its token and stores messages in its own directory", async (t
   await call("send_message", { bot: "202", chat_id: 7, text: "Second", confirm: true });
   assert.equal(calls[0].url, `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_2}/sendMessage`);
   assert.equal((await openStore(dataDir, 202).read()).chats[7].messages.length, 1);
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {} });
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });
 
 test("API errors redact both tokens and tell the caller to wait on 429", async (t) => {
@@ -172,5 +173,5 @@ test("A store lock failure preserves API success and does not overwrite the stor
   assert.match(result.store_error, /Another process is reading messages/);
   assert.equal(calls.length, 1);
   assert.equal(await readFile(lock, "utf8"), "Locked");
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {} });
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });

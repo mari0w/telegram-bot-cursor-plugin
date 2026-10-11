@@ -69,7 +69,7 @@ test("Business receive separates chats, keeps owner context, and removes deleted
   updates = [{ update_id: 5, business_message: {
     ...message(3), sender_business_bot: { id: 101 },
   } }];
-  assert.match(await call("read_new_messages", { all: true }), /no new messages/);
+  assert.match(await call("read_new_messages", { mode: "all" }), /no new messages/);
   assert.equal((await store.read()).chats["conn:7"].messages.at(-1).outgoing, true);
   updates = [{ update_id: 6, edited_business_message: { ...message(1), text: "Edited" } }];
   assert.match(await call("read_new_messages"), /\(edited\).*Edited/);
