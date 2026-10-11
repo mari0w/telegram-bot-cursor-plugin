@@ -41,6 +41,7 @@ for (const [name, method, kind, filename] of [
   ["send_photo", "sendPhoto", "photo", "photo.jpg"],
   ["send_document", "sendDocument", "document", "file.pdf"],
 ]) test(`${name} previews local size; confirmation uploads FormData and saves file info`, async (t) => {
+  const timeout = t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
   const { call, calls, dataDir } = await setup(t, () => api(message(kind)));
   const file = path.join(dataDir, filename);
   await writeFile(file, "test");
@@ -57,6 +58,7 @@ for (const [name, method, kind, filename] of [
   const result = await call(name, { ...args, confirm: true });
   assert.ok(result.rate_reminder);
   assert.equal(calls.length, 1);
+  assert.deepEqual(timeout.mock.calls.map(({ arguments: args }) => args), [[120000]]);
   const { params, options } = calls[0];
   assert.equal(calls[0].method, method);
   assert.ok(params instanceof FormData);
@@ -93,6 +95,7 @@ test("Local upload limits apply to previews and are checked again before sending
 });
 
 test("Document URLs and photo file IDs preview their source and send JSON strings", async (t) => {
+  const timeout = t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
   const { call, calls, dataDir } = await setup(t, ({ method }) => api(message(method === "sendDocument" ? "document" : "photo")));
   for (const [name, field, file, kind] of [
     ["send_document", "document", "https://example.com/file.pdf", "url"],
@@ -111,6 +114,7 @@ test("Document URLs and photo file IDs preview their source and send JSON string
     assert.equal(calls.at(-1).options.headers["content-type"], "application/json");
   }
   assert.equal(calls.length, 2);
+  assert.deepEqual(timeout.mock.calls.map(({ arguments: args }) => args), [[15000], [15000]]);
   assert.deepEqual((await openStore(dataDir, 101).read()).chats[7].messages[0].file,
     { kind: "document", file_id: "doc-id", file_name: "file.pdf", file_size: 4 });
 });
@@ -137,6 +141,7 @@ test("File send results, stored messages, and API errors redact both configured 
 });
 
 test("Download gets file info and saves bytes privately under the selected bot with the same proxy", async (t) => {
+  const timeout = t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
   const bytes = Buffer.from("file bytes");
   const file = { file_unique_id: "unique-doc", file_size: bytes.length, file_path: "documents/file.pdf" };
   const { call, calls, dataDir } = await setup(t, ({ method }) => method === "getFile" ? api(file) : new Response(bytes),
@@ -147,6 +152,7 @@ test("Download gets file info and saves bytes privately under the selected bot w
   assert.ok(!JSON.stringify(result).includes("https://"));
   assert.deepEqual(await readFile(result.path), bytes);
   assert.equal(calls.length, 2);
+  assert.deepEqual(timeout.mock.calls.map(({ arguments: args }) => args), [[15000], [120000]]);
   assert.equal(calls[0].method, "getFile");
   assert.deepEqual(calls[0].params, { file_id: "doc-id" });
   assert.equal(calls[1].url, `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN_2}/${file.file_path}`);

@@ -69,7 +69,8 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           else body.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
         }
       }
-      const result = await callApi(entry.token, method, body, { fetch, env });
+      const result = await callApi(entry.token, method, body,
+        { fetch, env, ...(body instanceof FormData ? { timeoutMs: 120000 } : {}) });
       const response = { ...(result === true ? (method === "deleteMessage" ? { deleted: true } : { ok: true }) : result),
         rate_reminder: RATE_REMINDER };
       if (store && (method === "deleteMessage" || result !== true)) try {
@@ -135,7 +136,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const file = await callApi(entry.token, "getFile", { file_id }, { fetch, env });
-      const bytes = await downloadFile(entry.token, file.file_path, { fetch, env });
+      const bytes = await downloadFile(entry.token, file.file_path, { fetch, env, timeoutMs: 120000 });
       const dir = path.join(openStore(dataDir, entry.id).dir, "files");
       await mkdir(dir, { recursive: true, mode: 0o700 });
       const localPath = path.join(dir, `${file.file_unique_id}_${path.basename(file.file_path)}`);
