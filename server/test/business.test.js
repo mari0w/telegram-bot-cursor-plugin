@@ -101,6 +101,21 @@ test("Business send previews the owner identity and sends with the connection", 
   assert.equal(saved.text, "Sent [REDACTED]");
 });
 
+test("Outgoing business echoes replace the sent message within the same chat key", () => {
+  const state = { chats: {}, pending: [] };
+  const sent = message(2, 1, "Sent");
+  addMessage(state, { ...sent, business_connection_id: undefined });
+  addMessage(state, sent, { outgoing: true });
+  addMessage(state, { ...sent, text: "Echo", sender_business_bot: { id: 101 } }, { update_id: 3 });
+  const saved = state.chats["conn:7"].messages;
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].update_id, 3);
+  assert.equal(saved[0].text, "Echo");
+  assert.equal(saved[0].outgoing, true);
+  assert.equal(state.chats[7].messages[0].text, "Sent");
+  assert.deepEqual(state.pending, [["7", 2]]);
+});
+
 test("Receive looks up missing and empty connections before it stores owner messages", async (t) => {
   let updates;
   const { call, store, calls } = await setup(t, (method) => ({ ok: true, result: method === "getMe"

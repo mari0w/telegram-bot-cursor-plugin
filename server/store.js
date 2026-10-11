@@ -67,6 +67,7 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
   const key = chatKey(source.chat.id, id);
   const entry = store.chats[key] ??= { chat: {}, messages: [] };
   if (update_id !== undefined && entry.messages.some((message) => message.update_id === update_id)) return;
+  if (!id) delete entry.left;
   entry.chat = pick(source.chat, ["id", "type", "title", "username", "first_name", "last_name"]);
   const message = { ...pick({ update_id }, ["update_id"]), ...pick(source, ["message_id", "date", "edit_date"]),
     chat_id: source.chat.id };
@@ -91,7 +92,7 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
     "group_chat_created", "supergroup_chat_created", "channel_chat_created", "message_auto_delete_timer_changed",
     "migrate_to_chat_id", "migrate_from_chat_id", "pinned_message"].some((key) => source[key] !== undefined)) message.service = true;
   if (edited) message.edited = true;
-  const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
+  const index = entry.messages.findIndex((item) => item.message_id === message.message_id);
   if (index === -1) entry.messages.push(message);
   else entry.messages[index] = message;
   store.pending ??= [];

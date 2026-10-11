@@ -123,6 +123,19 @@ test("Receive saves bot joins and leaves without messages", async (t) => {
   assert.equal(saved.offset, 4);
 });
 
+test("A non-business message clears a stale left flag", () => {
+  const state = { chats: {}, pending: [] };
+  addUpdates(state, [{ update_id: 1, my_chat_member: {
+    chat: update(2).message.chat, new_chat_member: { status: "left" },
+  } }]);
+  addUpdates(state, [{ update_id: 2, business_message: {
+    ...update(2).message, business_connection_id: "conn",
+  } }]);
+  assert.equal(state.chats[7].left, true);
+  addUpdates(state, [update(3)]);
+  assert.equal(Object.hasOwn(state.chats[7], "left"), false);
+});
+
 test("Receive omits stale or unknown offsets and saves the last update time only for nonempty batches", async (t) => {
   const now = 2000000;
   t.mock.method(Date, "now", () => now * 1000);
