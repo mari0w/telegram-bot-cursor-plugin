@@ -82,14 +82,14 @@ test("Receive omits stale or unknown offsets and saves the last update time only
   let updates = [];
   const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: updates }));
   const store = openStore(dataDir, 101);
-  for (const last_update_at of [now - 7 * 24 * 60 * 60 - 1, now - 7 * 24 * 60 * 60,
-    undefined, now - 7 * 24 * 60 * 60 + 1]) {
+  for (const last_update_at of [now - 6 * 24 * 60 * 60 - 1, now - 6 * 24 * 60 * 60,
+    undefined, now - 6 * 24 * 60 * 60 + 1]) {
     const state = { offset: 100, chats: {}, ...(last_update_at === undefined ? {} : { last_update_at }) };
     await store.write(state);
     updates = [];
     await call("read_new_messages");
     assert.deepEqual(calls.at(-1).params, { timeout: 0, limit: 100, allowed_updates,
-      ...(last_update_at === now - 7 * 24 * 60 * 60 + 1 ? { offset: 100 } : {}) });
+      ...(last_update_at === now - 6 * 24 * 60 * 60 + 1 ? { offset: 100 } : {}) });
     assert.deepEqual(await store.read(), state);
     updates = [update(10)];
     await call("read_new_messages");

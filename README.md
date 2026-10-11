@@ -275,7 +275,7 @@ It keeps the last 200 messages per chat.
 It stores short fields only.
 It does not store a token.
 It saves the offset in the same file as the messages.
-It saves `last_update_at` in Unix seconds and omits the offset after 7 days without updates.
+It saves the fetch time as `last_update_at` in Unix seconds and omits the offset after 6 days because Telegram can hold updates for 24 hours.
 `poll.lock` prevents two processes from polling one bot at the same time.
 To clear saved data, delete the bot directory.
 If a crash leaves a stale `poll.lock`, delete it when no other process reads messages for that bot.

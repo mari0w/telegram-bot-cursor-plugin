@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProxyAgent } from "undici";
-import { callApi, errorMessage, redact } from "../telegram.js";
+import { callApi, downloadFile, errorMessage, redact } from "../telegram.js";
 const token = "101:fake-token";
 
 test("POST JSON to the method; use and reuse a dispatcher only with a proxy", async () => {
@@ -48,7 +48,18 @@ test("Redact encoded configured and unconfigured tokens, including lowercase %3a
     "configured [REDACTED]; other [REDACTED] [REDACTED]");
 });
 
-test("An optional request timeout sets the fetch signal", async (t) => {
+test("API calls and file downloads default to a 15-second timeout", async (t) => {
+  const signal = new AbortController().signal;
+  t.mock.method(AbortSignal, "timeout", (ms) => { assert.equal(ms, 15000); return signal; });
+  const fetch = async (url, options) => {
+    assert.equal(options.signal, signal);
+    return { ok: true, json: async () => ({ ok: true, result: [] }), arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+  await callApi(token, "getMe", {}, { env: {}, fetch });
+  await downloadFile(token, "file.txt", { env: {}, fetch });
+});
+
+test("An explicit request timeout sets the fetch signal", async (t) => {
   const signal = new AbortController().signal;
   t.mock.method(AbortSignal, "timeout", (ms) => { assert.equal(ms, 12000); return signal; });
   await callApi(token, "getUpdates", {}, { env: {}, timeoutMs: 12000, fetch: async (url, options) => {

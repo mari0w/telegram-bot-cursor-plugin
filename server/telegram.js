@@ -27,13 +27,13 @@ function dispatcherOptions(env) {
   return proxyDispatcher ? { dispatcher: proxyDispatcher } : {};
 }
 
-export async function callApi(token, method, params, { fetch = globalThis.fetch, env = process.env, timeoutMs } = {}) {
+export async function callApi(token, method, params, { fetch = globalThis.fetch, env = process.env, timeoutMs = 15000 } = {}) {
   try {
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: "POST",
       ...(params instanceof FormData ? { body: params }
         : { headers: { "content-type": "application/json" }, body: JSON.stringify(params) }),
-      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
+      signal: AbortSignal.timeout(timeoutMs),
       ...dispatcherOptions(env),
     });
     const body = await response.json();
@@ -52,10 +52,10 @@ export async function callApi(token, method, params, { fetch = globalThis.fetch,
   }
 }
 
-export async function downloadFile(token, filePath, { fetch = globalThis.fetch, env = process.env, timeoutMs } = {}) {
+export async function downloadFile(token, filePath, { fetch = globalThis.fetch, env = process.env, timeoutMs = 15000 } = {}) {
   try {
     const response = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, {
-      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
+      signal: AbortSignal.timeout(timeoutMs),
       ...dispatcherOptions(env),
     });
     if (!response.ok) throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);

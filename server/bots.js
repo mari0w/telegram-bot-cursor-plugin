@@ -26,7 +26,7 @@ export async function selectBot(bots, bot, getUsername) {
     try {
       username = await getUsername(entry);
     } catch (error) {
-      lastError = error;
+      lastError = new Error(`bot ${entry.number}: ${error.message}`);
       continue;
     }
     if (username && username.toLowerCase() === name) return entry;

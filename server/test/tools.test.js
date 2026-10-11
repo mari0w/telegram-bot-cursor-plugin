@@ -27,6 +27,12 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
     return result;
   };
   const data = (result) => JSON.parse(result.content[0].text);
+  fail = true;
+  const lookupFailure = await call("get_me", { bot: "unknown" });
+  assert.equal(lookupFailure.isError, true);
+  assert.match(lookupFailure.content[0].text, /bot 2: \[REDACTED\] \[REDACTED\]/);
+  fail = false;
+  calls = 0;
   assert.deepEqual(data(await call("list_bots")), [
     { number: 1, id: "101", default: true, username: "bot_101", first_name: "Bot", ok: true },
     { number: 2, id: "202", default: false, username: "bot_202", first_name: "Bot", ok: true },
