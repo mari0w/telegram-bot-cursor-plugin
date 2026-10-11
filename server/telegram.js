@@ -14,7 +14,7 @@ export function errorMessage(error, tokens) {
   return redact([error?.message ?? String(error), error?.cause?.message].filter(Boolean).join(": "), tokens);
 }
 
-export async function callApi(token, method, params, { fetch = globalThis.fetch, env = process.env } = {}) {
+export async function callApi(token, method, params, { fetch = globalThis.fetch, env = process.env, timeoutMs } = {}) {
   try {
     const proxyUrl = resolveProxyUrl(env);
     if (proxyUrl !== cachedProxyUrl) {
@@ -27,16 +27,21 @@ export async function callApi(token, method, params, { fetch = globalThis.fetch,
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(params),
+      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
       ...(proxyDispatcher ? { dispatcher: proxyDispatcher } : {}),
     });
     const body = await response.json();
     if (!body.ok) {
       const retry = body.parameters?.retry_after;
       const hint = retry === undefined ? "" : ` Retry after ${retry} s. Stop sending. Do not retry at once.`;
-      throw new Error(`Telegram API ${method} failed: ${body.error_code} ${body.description}${hint}`);
+      const error = new Error(`Telegram API ${method} failed: ${body.error_code} ${body.description}${hint}`);
+      error.code = body.error_code ?? response.status;
+      throw error;
     }
     return body.result;
   } catch (error) {
-    throw new Error(errorMessage(error, [token]));
+    const safeError = new Error(errorMessage(error, [token]));
+    safeError.code = error.code;
+    throw safeError;
   }
 }
