@@ -47,12 +47,31 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
   };
 }
 
-export function addMessage(store, source, { update_id, edited = false } = {}) {
-  const entry = store.chats[source.chat.id] ??= { chat: {}, messages: [] };
+export const chatKey = (id, business_connection_id) => business_connection_id
+  ? `${business_connection_id}:${id}` : String(id);
+
+export function addBusinessConnection(store, connection) {
+  store.business ??= {};
+  store.business[connection.id] = { user_id: connection.user.id,
+    user_name: connection.user.username || connection.user.first_name,
+    ...pick({ user_username: connection.user.username }, ["user_username"]),
+    user_chat_id: connection.user_chat_id, can_reply: connection.rights?.can_reply === true,
+    is_enabled: connection.is_enabled, date: connection.date };
+}
+
+export function addMessage(store, source, { update_id, edited = false, outgoing = false } = {}) {
+  const id = source.business_connection_id;
+  const entry = store.chats[chatKey(source.chat.id, id)] ??= { chat: {}, messages: [] };
   if (update_id !== undefined && entry.messages.some((message) => message.update_id === update_id)) return;
   entry.chat = pick(source.chat, ["id", "type", "title", "username", "first_name", "last_name"]);
   const message = { ...pick({ update_id }, ["update_id"]), ...pick(source, ["message_id", "date", "edit_date"]),
     chat_id: source.chat.id };
+  if (id) {
+    store.business ??= {};
+    const connection = store.business[id] ??= {};
+    entry.business_connection_id = message.business_connection_id = id;
+    if (outgoing || (source.from && source.from.id === connection.user_id) || source.sender_business_bot) message.outgoing = true;
+  }
   if (source.from) message.from = pick(source.from, ["id", "is_bot", "username", "first_name", "last_name"]);
   if (source.text !== undefined || source.caption !== undefined) message.text = source.text ?? source.caption;
   const kind = ["photo", "animation", "document", "video", "audio", "voice", "sticker", "video_note"]
@@ -63,6 +82,8 @@ export function addMessage(store, source, { update_id, edited = false } = {}) {
     message.file = { kind, ...pick(file, ["file_id", "file_name", "file_size", "mime_type"]) };
   }
   if (source.reply_to_message) message.reply_to_message_id = source.reply_to_message.message_id;
+  if (source.reply_to_message?.from) message.reply_to_from_id = source.reply_to_message.from.id;
+  if (!source.text && !source.caption && !message.file) message.service = true;
   if (edited) message.edited = true;
   const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
   if (index === -1) entry.messages.push(message);
@@ -72,9 +93,19 @@ export function addMessage(store, source, { update_id, edited = false } = {}) {
 }
 
 export function addUpdates(store, updates) {
-  const messages = [];
+  let messages = [];
   for (const update of updates) {
-    const type = ["message", "edited_message", "channel_post", "edited_channel_post"]
+    if (update.business_connection) addBusinessConnection(store, update.business_connection);
+    if (update.deleted_business_messages) {
+      const { business_connection_id, chat, message_ids } = update.deleted_business_messages;
+      const key = chatKey(chat.id, business_connection_id);
+      const entry = store.chats[key];
+      if (entry) entry.messages = entry.messages.filter((message) => !message_ids.includes(message.message_id));
+      messages = messages.filter((message) => chatKey(message.chat_id, message.business_connection_id) !== key
+        || !message_ids.includes(message.message_id));
+    }
+    const type = ["message", "edited_message", "channel_post", "edited_channel_post",
+      "business_message", "edited_business_message"]
       .find((key) => update[key]);
     if (!type) continue;
     const message = addMessage(store, update[type], { update_id: update.update_id, edited: type.startsWith("edited_") });

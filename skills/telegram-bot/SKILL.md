@@ -5,7 +5,7 @@ description: Use the Telegram Bot API to manage bots, messages, files, chat deta
 
 # Telegram Bot
 
-Use the tools in version 1.0.0.
+Use the tools in version 1.1.0.
 
 1. Call `list_bots` first.
 2. Pass `bot` with a username or numeric bot ID to select a bot.
@@ -19,9 +19,132 @@ Use the tools in version 1.0.0.
 
 `read_new_messages` runs once per call.
 It does not poll in the background.
-If `more` is true, call it again to read more updates.
+If the result says that more updates are waiting, call it again.
 Tell the user that Telegram keeps incoming updates for no more than 24 hours.
 Messages older than 24 hours on the server are lost if nobody reads them.
+
+## Setup guide
+
+Call `get_me` or `list_bots` to check `next_step`.
+The done text is 「设置已完成。可以把机器人加进需要的群，然后让我读新消息，或每天给你总结和待办。」.
+If `next_step` is not the done text, lead the owner one step at a time.
+Tell only the next step in plain words: which chat to open, which command to send, and which button to tap.
+Do not use technical words with the owner.
+Wait until the owner says the step is done.
+Call `get_me` or `list_bots` again to check before the next step.
+After privacy mode is off, tell the owner to remove the bot from old groups and add it again.
+After the owner connects the bot, call `read_new_messages` once to receive the connection.
+Then call `get_me` again to check it.
+Telegram Premium is not needed for business bots.
+Bot API 10.0 removed this requirement. See the [Bot API changelog](https://core.telegram.org/bots/api-changelog).
+
+## Telegram Business
+
+For a daily summary:
+
+1. Call `read_new_messages`. Repeat if more updates are waiting.
+2. Call `get_chat_messages` for each chat that needs more context.
+3. Give the owner a daily summary and a to-do list.
+
+Use the business chat key from the result for history and send tools.
+Sending in a business chat sends as the owner.
+Show the preview to the owner.
+Set `confirm=true` only after the owner agrees.
+The bot can reply only in private chats with incoming messages in the last 24 hours.
+See [BusinessBotRights](https://core.telegram.org/bots/api#businessbotrights).
+Owner messages are context only in saved history.
+Never mark messages as read.
+
+## Message filter
+
+All message filtering runs locally.
+It uses fixed rules, with no AI judgment or external service.
+The owner must approve every addition, change, or deletion of a rule.
+Always show the `set_filters` preview text to the owner as is first.
+Point out the messages that might be hidden by mistake.
+Save with `confirm=true` only after the owner clearly agrees.
+Never add rules by yourself.
+Use everyday language with the owner. Call messages that are put away 「收起」.
+Do not reveal regex, JSON, chat IDs, or file paths.
+The `get_filters` result is for the AI.
+
+Read the owner's real saved messages with `get_chat_messages` before you choose a rule.
+Use `show_filtered=true` when you need to inspect messages that are already 收起.
+Make the rule as specific as possible.
+Do not use a single common word.
+Prefer several words that must all appear, or limit the rule to one group or one person.
+Protected words and messages for the owner are kept by default.
+If the owner says a message was hidden by mistake, propose a rule change with `set_filters`.
+Show the preview and point out possible mistakes.
+Confirm only after the owner agrees.
+
+`read_new_messages` returns compact text.
+Private chats, including business private chats, are messages for the owner.
+Bot and owner `@mentions`, and replies to the bot or owner, are also messages for the owner.
+The owner is the user of a known business connection.
+These messages show in full by default.
+Allowed chats, allowed users, and include matches also show in full.
+Other group, supergroup, and channel messages use one summary line per chat.
+Muted chats show a summary line only, including messages for the owner.
+Messages that are 收起 are saved too.
+The count says 「已收起 N 条。」.
+Use `all=true` to show all incoming new messages as full lines.
+Use `get_chat_messages` with `show_filtered=true` to view saved messages that are 收起.
+Text longer than 500 characters is cut to 500 characters plus `…`.
+
+The config is `~/.telegram-bot-cursor-plugin/<bot ID>/filters.json`.
+The config file uses mode `0600`. The bot directory uses mode `0700`.
+All fields are arrays.
+They are empty by default except `protected_words`.
+A missing file or missing `protected_words` field uses `["投诉", "退款", "急"]`.
+An explicit empty array removes these protected words.
+
+- `allow_chats` shows messages from these chat IDs in full.
+- `mute_chats` shows only a summary line for these chat IDs.
+- `exclude_keywords` puts away text that contains any listed word.
+- `include_keywords` shows text that contains any listed word in full.
+- `exclude_regex` puts away text that matches any JavaScript RegExp source with flag `i`.
+- `include_regex` shows matching text in full with flag `i`.
+- `allow_users` shows messages from these sender IDs or usernames in full.
+- `block_users` puts away messages from these sender IDs or usernames.
+- `exclude_rules` contains objects with optional `words`, `pattern`, `chats`, `users`, and `include_for_me`.
+- `protected_words` keeps text with any listed word from all exclude rules.
+
+Each `exclude_rules` item requires all given conditions to match.
+All `words` must appear. `pattern` uses JavaScript RegExp with flag `i`.
+`chats` limits the rule to listed chats. `users` limits it to listed senders.
+Only an item with `include_for_me: true` can put away messages for the owner.
+Simple keyword and regex exclusions never put away messages for the owner.
+Protected words also stop an `include_for_me` exclusion.
+Chat IDs compare as strings. Use business chat keys for business chats.
+Usernames can have an `@` prefix. Username and word matching ignore case.
+Words match substrings of text, including captions.
+Patterns are checked before a rule is saved.
+
+Apply rules in this order:
+
+1. Put away messages from blocked users, service messages, and stickers.
+2. Apply exclude rules, subject to protected words and messages for the owner.
+3. Show muted chats as summaries.
+4. Show messages for the owner, allowed chats, allowed users, and include matches in full.
+5. Show other messages in a group summary.
+
+To change rules:
+
+1. Read real saved messages with `get_chat_messages`.
+2. Call `get_filters` for the bot.
+3. Call `set_filters` with changed fields to get a preview.
+4. Show the preview as is. Point out messages that might be hidden by mistake.
+5. Wait for the owner to clearly agree.
+6. Call `set_filters` with the same fields and `confirm=true`.
+
+Given fields replace saved arrays. Omitted fields keep saved values.
+Pass the full new list, including existing items.
+The preview compares all saved messages with current and proposed rules.
+It says 「按现在已保存的消息算，会多收起 N 条。」 and gives up to three examples.
+A separate 「可能误收的消息（请看一下）：」 block gives up to three new matches
+that have more than 100 characters, contain `?` or `？`, or come from private chats.
+The preview does not save the rule.
 
 ## Changes need agreement
 
@@ -59,7 +182,8 @@ Use `edit_message` to change message text.
 Use `delete_message` to remove a message.
 Use `forward_message` to send a message to a target chat.
 Use the preview and agreement flow for each action.
-The bot sends as itself.
+The bot sends as itself in normal bot chats.
+It sends as the owner in business chats.
 Others in the chat can see the message.
 Set `parse_mode` to `HTML` or `MarkdownV2` for send or edit.
 Omit it for plain text.
@@ -80,7 +204,7 @@ See [Telegram bots](https://core.telegram.org/bots).
 Use `send_photo` for photos.
 Use `send_document` for other files.
 Set `file` to an existing local file path, an HTTP(S) URL, or a Telegram `file_id`.
-Use a file ID from `read_new_messages` or `get_chat_messages`.
+Use a file ID from the bot's `store.json`.
 Use the same bot that received the file ID.
 Use the preview and agreement flow before sending.
 The preview shows the source and local file size.

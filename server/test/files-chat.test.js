@@ -25,7 +25,7 @@ async function setup(t, reply, extraEnv = {}) {
     calls.push({ url, method, params, options });
     return reply(calls.at(-1));
   } });
-  const client = new Client({ name: "files-chat-test", version: "1.0.0" });
+  const client = new Client({ name: "files-chat-test", version: "1.1.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
