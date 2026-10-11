@@ -1,8 +1,9 @@
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { ProxyAgent } from "undici";
-import { callApi, downloadFile, errorMessage, redact } from "../telegram.js";
+import { callApi, downloadFile, errorMessage, redact, resetProxyPreferenceForTests } from "../telegram.js";
 const token = "101:fake-token";
+beforeEach(resetProxyPreferenceForTests);
 
 test("POST JSON to the method; use and reuse a dispatcher only with a proxy", async () => {
   const dispatchers = [];
@@ -22,6 +23,108 @@ test("POST JSON to the method; use and reuse a dispatcher only with a proxy", as
   assert.equal(dispatchers[1], dispatchers[2]);
   assert.equal(dispatchers[0], undefined);
   assert.equal(dispatchers[3], undefined);
+  assert.equal(dispatchers.length, 4);
+});
+
+test("Retry a proxy connection failure once and use direct connections after success", async (t) => {
+  for (const error of [new DOMException("aborted", "AbortError"), new DOMException("expired", "TimeoutError"),
+    new Error("request failed", { cause: new Error("ECONNRESET") })]) {
+    resetProxyPreferenceForTests();
+    const fetch = t.mock.fn(async () => ({ json: async () => ({ ok: true, result: 101 }) }));
+    fetch.mock.mockImplementationOnce(async () => { throw error; });
+    const options = { fetch, env: { HTTPS_PROXY: "proxy:8080" } };
+    assert.equal(await callApi(token, "getMe", {}, options), 101);
+    assert.equal(await callApi(token, "getMe", {}, options), 101);
+    const calls = fetch.mock.calls.map(({ arguments: args }) => args);
+    assert.equal(calls.length, 3);
+    assert.ok(calls[0][1].dispatcher instanceof ProxyAgent);
+    for (const [url, request] of calls.slice(1)) {
+      assert.equal(url, calls[0][0]);
+      assert.equal(request.body, calls[0][1].body);
+      assert.ok(!Object.hasOwn(request, "dispatcher"));
+      assert.notEqual(request.signal, calls[0][1].signal);
+    }
+  }
+});
+
+test("Do not retry Telegram API errors through a proxy; redact the token", async (t) => {
+  const fetch = t.mock.fn(async () => ({ json: async () => ({
+    ok: false, error_code: 500, description: `socket timeout ${token}`,
+  }) }));
+  await assert.rejects(callApi(token, "getMe", {}, { fetch, env: { HTTPS_PROXY: "proxy:8080" } }),
+    { message: "Telegram API getMe failed: 500 socket timeout [REDACTED]", code: 500 });
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.ok(fetch.mock.calls[0].arguments[1].dispatcher instanceof ProxyAgent);
+});
+
+test("Only allowlisted read methods retry proxy failures", async (t) => {
+  for (const method of ["getUpdates", "getMe", "getFile", "getChat", "getChatAdministrators",
+    "getMyCommands", "getWebhookInfo", "getBusinessConnection"]) {
+    resetProxyPreferenceForTests();
+    const fetch = t.mock.fn(async () => ({ json: async () => ({ ok: true, result: [] }) }));
+    fetch.mock.mockImplementationOnce(async () => { throw new DOMException("expired", "TimeoutError"); });
+    assert.deepEqual(await callApi(token, method, {}, { fetch, env: { HTTPS_PROXY: "proxy:8080" } }), []);
+    assert.equal(fetch.mock.callCount(), 2, method);
+    assert.ok(fetch.mock.calls[0].arguments[1].dispatcher instanceof ProxyAgent);
+    assert.ok(!Object.hasOwn(fetch.mock.calls[1].arguments[1], "dispatcher"));
+  }
+  for (const method of ["sendMessage", "editMessageText", "deleteMessage", "deleteBusinessMessages",
+    "forwardMessage", "pinChatMessage", "unpinChatMessage", "setMyCommands", "sendPhoto",
+    "sendDocument", "deleteWebhook", "unknownMethod"]) {
+    for (const error of [new DOMException("expired", "TimeoutError"), new Error("ECONNRESET")]) {
+      resetProxyPreferenceForTests();
+      const fetch = t.mock.fn(async () => { throw error; });
+      await assert.rejects(callApi(token, method, {}, { fetch, env: { HTTPS_PROXY: "proxy:8080" } }),
+        { message: error.message });
+      assert.equal(fetch.mock.callCount(), 1, method);
+      assert.ok(fetch.mock.calls[0].arguments[1].dispatcher instanceof ProxyAgent);
+    }
+  }
+});
+
+test("Retry file downloads with a direct connection", async (t) => {
+  const fetch = t.mock.fn(async () => ({ ok: true, arrayBuffer: async () => Uint8Array.of(1, 2).buffer }));
+  fetch.mock.mockImplementationOnce(async () => { throw new Error("fetch failed"); });
+  const options = { fetch, env: { HTTPS_PROXY: "proxy:8080" } };
+  assert.deepEqual(await downloadFile(token, "file.txt", options), Buffer.from([1, 2]));
+  assert.equal(fetch.mock.callCount(), 2);
+  assert.ok(fetch.mock.calls[0].arguments[1].dispatcher instanceof ProxyAgent);
+  assert.ok(!Object.hasOwn(fetch.mock.calls[1].arguments[1], "dispatcher"));
+  assert.equal(fetch.mock.calls[0].arguments[0], fetch.mock.calls[1].arguments[0]);
+  await downloadFile(token, "file.txt", options);
+  assert.equal(fetch.mock.callCount(), 3);
+  assert.ok(!Object.hasOwn(fetch.mock.calls[2].arguments[1], "dispatcher"));
+});
+
+test("A failed direct response body keeps the proxy preference", async (t) => {
+  for (const download of [false, true]) {
+    resetProxyPreferenceForTests();
+    const fetch = t.mock.fn(async () => ({
+      ok: true,
+      json: async () => { throw new Error("body failed"); },
+      arrayBuffer: async () => { throw new Error("body failed"); },
+    }));
+    fetch.mock.mockImplementationOnce(async () => { throw new DOMException("expired", "TimeoutError"); });
+    const options = { fetch, env: { HTTPS_PROXY: "proxy:8080" } };
+    await assert.rejects(download ? downloadFile(token, "file.txt", options)
+      : callApi(token, "getMe", {}, options), { message: "body failed" });
+    assert.equal(fetch.mock.callCount(), 2);
+    assert.ok(!Object.hasOwn(fetch.mock.calls[1].arguments[1], "dispatcher"));
+    fetch.mock.mockImplementation(async () => ({ json: async () => ({ ok: true, result: 101 }) }));
+    await callApi(token, "getMe", {}, options);
+    assert.ok(fetch.mock.calls[2].arguments[1].dispatcher instanceof ProxyAgent);
+  }
+});
+
+test("A failed direct retry keeps the proxy preference and redacts the token", async (t) => {
+  const fetch = t.mock.fn(async () => { throw new Error(`fetch failed ${token}`); });
+  const options = { fetch, env: { HTTPS_PROXY: "proxy:8080" } };
+  await assert.rejects(callApi(token, "getMe", {}, options), { message: "fetch failed [REDACTED]" });
+  assert.equal(fetch.mock.callCount(), 2);
+  assert.ok(!Object.hasOwn(fetch.mock.calls[1].arguments[1], "dispatcher"));
+  fetch.mock.mockImplementation(async () => ({ json: async () => ({ ok: true, result: 101 }) }));
+  await callApi(token, "getMe", {}, options);
+  assert.ok(fetch.mock.calls[2].arguments[1].dispatcher instanceof ProxyAgent);
 });
 
 test("Redact API errors, network messages and causes, and unconfigured tokens", async () => {
