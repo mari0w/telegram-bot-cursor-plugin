@@ -153,6 +153,25 @@ test("Known business owners are protected in new messages, saved history, and pr
   assert.doesNotMatch(preview, /可能误收的消息/);
 });
 
+test("An owner without a username is not matched by a first name mention in a group", async (t) => {
+  const updates = [{ update_id: 1, message: {
+    message_id: 1, date: 1, chat: group, from: message.from, text: "@Alice 订单",
+  } }];
+  const { call, store } = await setup(t, (method) => method === "getMe" ? me : updates);
+  const state = { offset: 0, chats: {} };
+  addBusinessConnection(state, { ...connection, user: { id: 1, first_name: "Alice" } });
+  assert.equal(state.business.conn.user_name, "Alice");
+  assert.equal(state.business.conn.user_username, undefined);
+  await store.write(state);
+  await call("set_filters", { exclude_keywords: ["订单"], confirm: true });
+  const fresh = (await call("read_new_messages")).content[0].text;
+  assert.doesNotMatch(fresh, /@Alice/);
+  assert.match(fresh, /已收起 1 条/);
+  const history = (await call("get_chat_messages", { chat_id: group.id })).content[0].text;
+  assert.doesNotMatch(history, /@Alice/);
+  assert.match(history, /已收起 1 条/);
+});
+
 test("get_me returns the first missing setup step and the done text", async (t) => {
   let privacy = false;
   const { call, store } = await setup(t, (method) => method === "getMe"

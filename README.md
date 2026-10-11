@@ -619,7 +619,7 @@ If a crash leaves a stale `poll.lock`, delete it when no other process reads mes
 Connections are saved in `store.business` by connection ID.
 The saved fields are `user_id`, `user_name`, `user_username`, `user_chat_id`, `can_reply`, `is_enabled`, and `date`.
 `user_username` stores the owner username when Telegram supplies it.
-Older saved connections use `user_name` until they are refreshed.
+Owner mentions use only `user_username`. Refresh older saved connections to store this field.
 Unknown connections get an empty entry.
 
 Business chats use `<business_connection_id>:<chat id>` as the store key.

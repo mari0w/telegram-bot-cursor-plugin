@@ -77,6 +77,23 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
 });
 
+test("A location message is shown and a new_chat_members message is filtered as service", async (t) => {
+  const location = update(1);
+  delete location.message.text;
+  location.message.location = { latitude: 31, longitude: 121 };
+  const joined = update(2);
+  delete joined.message.text;
+  joined.message.new_chat_members = [{ id: 9, first_name: "User" }];
+  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [location, joined] }));
+  const output = await call("read_new_messages");
+  assert.match(output, /\(chat 7\) #1 /);
+  assert.doesNotMatch(output, /#2 /);
+  assert.match(output, /已收起 1 条/);
+  const saved = (await openStore(dataDir, 101).read()).chats[7].messages;
+  assert.equal(saved[0].service, undefined);
+  assert.equal(saved[1].service, true);
+});
+
 test("Receive omits stale or unknown offsets and saves the last update time only for nonempty batches", async (t) => {
   const now = 2000000;
   t.mock.method(Date, "now", () => now * 1000);

@@ -66,6 +66,20 @@ test("All message tools need confirmation and preview saved or unknown chats wit
   assert.ok(calls.every(({ method }) => method === "getMe"));
 });
 
+test("A getMe failure on the first read leaves the offset unchanged and does not poll", async (t) => {
+  const { call, calls, dataDir } = await setup(t, (method) => method === "getMe"
+    ? { ok: false, error_code: 401, description: "Unauthorized" }
+    : { ok: true, result: [{ update_id: 10, message: message(10) }] });
+  const store = openStore(dataDir, 101);
+  const state = { offset: 7, last_update_at: Math.floor(Date.now() / 1000), chats: {} };
+  await store.write(state);
+  const result = await call("read_new_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Telegram API getMe failed: 401 Unauthorized/);
+  assert.deepEqual(calls.map(({ method }) => method), ["getMe"]);
+  assert.deepEqual(await store.read(), state);
+});
+
 test("Send maps reply parameters and saves both sides of the chat", async (t) => {
   const incoming = { ...message(1, 7, "Incoming"), from: { id: 9, is_bot: false, first_name: "User" } };
   const sent = message(2, 7, "<b>Hello</b>");

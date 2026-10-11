@@ -63,8 +63,9 @@ test("Business receive separates chats, keeps owner context, and removes deleted
   const chats = await call("list_chats");
   assert.ok(chats.some((chat) => chat.id === "conn:7" && chat.chat_key === "conn:7" && chat.business_connection_id === "conn"));
   assert.ok(chats.some((chat) => chat.id === 7 && chat.chat_key === "7"));
-  assert.ok(calls[0].params.allowed_updates.includes("business_connection"));
-  assert.ok(calls[0].params.allowed_updates.includes("deleted_business_messages"));
+  assert.deepEqual(calls.map(({ method }) => method), ["getMe", "getUpdates"]);
+  assert.ok(calls[1].params.allowed_updates.includes("business_connection"));
+  assert.ok(calls[1].params.allowed_updates.includes("deleted_business_messages"));
   updates = [{ update_id: 5, business_message: {
     ...message(3), sender_business_bot: { id: 101 },
   } }];
@@ -98,6 +99,31 @@ test("Business send previews the owner identity and sends with the connection", 
   const saved = (await store.read()).chats["conn:7"].messages[1];
   assert.equal(saved.outgoing, true);
   assert.equal(saved.text, "Sent [REDACTED]");
+});
+
+test("Business delete previews deleteBusinessMessages and removes only the stored business message", async (t) => {
+  const { call, store, calls } = await setup(t, () => ({ ok: true, result: true }));
+  const state = await store.read();
+  addMessage(state, message(1));
+  addMessage(state, message(2));
+  const normal = { ...message(1) };
+  delete normal.business_connection_id;
+  addMessage(state, normal);
+  await store.write(state);
+  const params = { business_connection_id: "conn", message_ids: [1] };
+  const preview = await call("delete_message", { chat_id: "conn:7", message_id: 1 });
+  assert.equal(preview.sent, false);
+  assert.deepEqual(preview.preview, { bot_id: "101", chat: state.chats["conn:7"].chat,
+    method: "deleteBusinessMessages", params });
+  assert.match(preview.notice, /Show this preview to the user\. Call again with confirm=true after the user agrees\./);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await store.read(), state);
+  const result = await call("delete_message", { chat_id: "conn:7", message_id: 1, confirm: true });
+  assert.equal(result.deleted, true);
+  assert.deepEqual(calls, [{ method: "deleteBusinessMessages", params }]);
+  const saved = await store.read();
+  assert.deepEqual(saved.chats["conn:7"].messages.map((item) => item.message_id), [2]);
+  assert.deepEqual(saved.chats[7].messages.map((item) => item.message_id), [1]);
 });
 
 test("Business status refreshes known connections and returns missing setup steps safely", async (t) => {

@@ -43,7 +43,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     const owners = Object.values(state.business ?? {});
     return { id: entry.id, username: await getUsername(entry),
       owner_ids: owners.map((owner) => owner.user_id).filter((id) => id !== undefined),
-      owner_usernames: owners.map((owner) => owner.user_username ?? owner.user_name).filter(Boolean) };
+      owner_usernames: owners.map((owner) => owner.user_username).filter(Boolean) };
   };
 
   const send = async (method, { bot, confirm, ...params }, notice) => {
@@ -64,13 +64,19 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       }
       const entry = await selectBot(bots, bot, getUsername);
       const savesMessage = ["sendMessage", "editMessageText", "forwardMessage", "sendPhoto", "sendDocument"].includes(method);
+      const deletesMessage = method === "deleteMessage";
       const store = openStore(dataDir, entry.id);
       const state = await store.read();
-      const key = params.chat_id;
+      const { chat_id: key, message_id } = params;
       const businessChat = typeof key === "string" && key.match(/^(.+):(-?\d+)$/);
-      if (businessChat && state.business?.[businessChat[1]]) {
-        params = { ...params, business_connection_id: businessChat[1], chat_id: Number(businessChat[2]) };
-        notice = "这条会以你本人的身份发送。";
+      if (businessChat && (deletesMessage || state.business?.[businessChat[1]])) {
+        if (deletesMessage) {
+          method = "deleteBusinessMessages";
+          params = { business_connection_id: businessChat[1], message_ids: [message_id] };
+        } else {
+          params = { ...params, business_connection_id: businessChat[1], chat_id: Number(businessChat[2]) };
+          notice = "这条会以你本人的身份发送。";
+        }
       }
       if (!confirm) {
         return textResult({ sent: false, preview: { bot_id: entry.id,
@@ -89,14 +95,14 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       }
       const result = await callApi(entry.token, method, body,
         { fetch, env, ...(body instanceof FormData ? { timeoutMs: 120000 } : {}) });
-      const response = { ...(result === true ? (method === "deleteMessage" ? { deleted: true } : { ok: true }) : result),
+      const response = { ...(result === true ? (deletesMessage ? { deleted: true } : { ok: true }) : result),
         rate_reminder: RATE_REMINDER };
-      if (method === "deleteMessage" || (savesMessage && result !== true)) try {
+      if (deletesMessage || (savesMessage && result !== true)) try {
         await store.withLock(async () => {
           const state = await store.read();
-          if (method === "deleteMessage") {
+          if (deletesMessage) {
             const chat = state.chats[key];
-            if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== params.message_id);
+            if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== message_id);
           } else {
             addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)),
               { edited: method === "editMessageText", outgoing: !!params.business_connection_id });
@@ -249,6 +255,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       const store = openStore(dataDir, entry.id);
       return await store.withLock(async () => {
         const state = await store.read();
+        const me = await filterMe(entry, state);
         const resetOffset = state.last_update_at === undefined ? state.offset > 0
           : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
         const updates = await callApi(entry.token, "getUpdates", {
@@ -259,7 +266,6 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           { fetch, env, timeoutMs: (timeout + 10) * 1000 });
         const messages = addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
         await store.write(state);
-        const me = await filterMe(entry, state);
         const rules = await readFilters(store.dir);
         return plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
           offset: state.offset, more: updates.length === 100, all }), tokens);

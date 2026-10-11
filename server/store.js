@@ -83,7 +83,9 @@ export function addMessage(store, source, { update_id, edited = false, outgoing 
   }
   if (source.reply_to_message) message.reply_to_message_id = source.reply_to_message.message_id;
   if (source.reply_to_message?.from) message.reply_to_from_id = source.reply_to_message.from.id;
-  if (!source.text && !source.caption && !message.file) message.service = true;
+  if (["new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+    "group_chat_created", "supergroup_chat_created", "channel_chat_created", "message_auto_delete_timer_changed",
+    "migrate_to_chat_id", "migrate_from_chat_id", "pinned_message"].some((key) => source[key] !== undefined)) message.service = true;
   if (edited) message.edited = true;
   const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
   if (index === -1) entry.messages.push(message);
