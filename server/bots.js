@@ -20,14 +20,17 @@ export async function selectBot(bots, bot, getUsername) {
   const name = bot.trim().replace(/^@/, "").toLowerCase();
   const byId = bots.find((entry) => entry.id === name);
   if (byId) return byId;
+  let lastError;
   for (const entry of bots) {
     let username;
     try {
       username = await getUsername(entry);
-    } catch {
+    } catch (error) {
+      lastError = error;
       continue;
     }
     if (username && username.toLowerCase() === name) return entry;
   }
+  if (lastError) throw lastError;
   throw new Error(`Unknown bot. Configured bot IDs: ${bots.map((entry) => entry.id).join(", ") || "none"}.`);
 }

@@ -19,6 +19,7 @@ See the [BotFather guide](https://core.telegram.org/bots/features#botfather).
 ## Configure tokens
 
 Set tokens in plugin Configure or in the MCP environment.
+Bot 1 (`TELEGRAM_BOT_TOKEN`) is required and is the default bot.
 `TELEGRAM_BOT_TOKEN` sets bot 1 as the default bot.
 Extra bots use `TELEGRAM_BOT_TOKEN_2` through `TELEGRAM_BOT_TOKEN_5`.
 You can set up to five bots.

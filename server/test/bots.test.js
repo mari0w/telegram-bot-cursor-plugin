@@ -44,6 +44,14 @@ test("Username lookup continues after a bot lookup fails", async () => {
   }), bots[1]);
 });
 
+test("Username lookup failure returns the lookup error", async () => {
+  const bots = loadBots({ TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN });
+  const lookupError = new Error("Lookup failed");
+  await assert.rejects(selectBot(bots, "first_bot", async () => {
+    throw lookupError;
+  }), (error) => error === lookupError);
+});
+
 test("Unknown bot has no fallback or token; missing default names its setting", async () => {
   await assert.rejects(selectBot(loadBots(env), env.TELEGRAM_BOT_TOKEN, async () => "first_bot"), (error) => {
     assert.equal(error.message, "Unknown bot. Configured bot IDs: 101, 202.");
