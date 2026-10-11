@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ProxyAgent } from "undici";
-import { callApi, errorMessage, redact } from "../telegram.js";
+import { callApi, downloadFile, errorMessage, redact } from "../telegram.js";
 const token = "101:fake-token";
 
 test("POST JSON to the method; use and reuse a dispatcher only with a proxy", async () => {
@@ -34,8 +34,36 @@ test("Redact API errors, network messages and causes, and unconfigured tokens", 
     await assert.rejects(callApi(token, "getMe", {}, { fetch, env: {} }), (caught) => {
       assert.ok(!caught.message.includes(token));
       assert.equal(caught.cause, undefined);
+      if (caught.message.includes("429")) assert.equal(caught.code, 429);
       if (caught.message.includes("429")) assert.match(caught.message, /Telegram API getMe failed: 429 .*Retry after 9 s\. Stop sending\. Do not retry at once\./);
       return true;
     });
   }
+});
+
+test("Redact encoded configured and unconfigured tokens, including lowercase %3a", () => {
+  const encoded = encodeURIComponent(token);
+  const other = encodeURIComponent(`999:${"a".repeat(30)}`);
+  assert.equal(redact(`configured ${encoded}; other ${other} ${other.replace("%3A", "%3a")}`, [token]),
+    "configured [REDACTED]; other [REDACTED] [REDACTED]");
+});
+
+test("API calls and file downloads default to a 15-second timeout", async (t) => {
+  const signal = new AbortController().signal;
+  t.mock.method(AbortSignal, "timeout", (ms) => { assert.equal(ms, 15000); return signal; });
+  const fetch = async (url, options) => {
+    assert.equal(options.signal, signal);
+    return { ok: true, json: async () => ({ ok: true, result: [] }), arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+  await callApi(token, "getMe", {}, { env: {}, fetch });
+  await downloadFile(token, "file.txt", { env: {}, fetch });
+});
+
+test("An explicit request timeout sets the fetch signal", async (t) => {
+  const signal = new AbortController().signal;
+  t.mock.method(AbortSignal, "timeout", (ms) => { assert.equal(ms, 12000); return signal; });
+  await callApi(token, "getUpdates", {}, { env: {}, timeoutMs: 12000, fetch: async (url, options) => {
+    assert.equal(options.signal, signal);
+    return { json: async () => ({ ok: true, result: [] }) };
+  } });
 });

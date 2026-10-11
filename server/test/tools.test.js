@@ -16,7 +16,7 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
       can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false,
       token: env.TELEGRAM_BOT_TOKEN } }) };
   } });
-  const client = new Client({ name: "test", version: "0.1.0" });
+  const client = new Client({ name: "test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); });
   await server.connect(serverTransport);
@@ -27,6 +27,12 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
     return result;
   };
   const data = (result) => JSON.parse(result.content[0].text);
+  fail = true;
+  const lookupFailure = await call("get_me", { bot: "unknown" });
+  assert.equal(lookupFailure.isError, true);
+  assert.match(lookupFailure.content[0].text, /bot 2: \[REDACTED\] \[REDACTED\]/);
+  fail = false;
+  calls = 0;
   assert.deepEqual(data(await call("list_bots")), [
     { number: 1, id: "101", default: true, username: "bot_101", first_name: "Bot", ok: true },
     { number: 2, id: "202", default: false, username: "bot_202", first_name: "Bot", ok: true },
