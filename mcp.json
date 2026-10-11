@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "telegram-bot": {
+      "command": "bash",
+      "args": ["${CURSOR_PLUGIN_ROOT}/scripts/run-mcp.sh"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN}",
+        "TELEGRAM_BOT_TOKEN_2": "${TELEGRAM_BOT_TOKEN_2}",
+        "TELEGRAM_BOT_TOKEN_3": "${TELEGRAM_BOT_TOKEN_3}",
+        "TELEGRAM_BOT_TOKEN_4": "${TELEGRAM_BOT_TOKEN_4}",
+        "TELEGRAM_BOT_TOKEN_5": "${TELEGRAM_BOT_TOKEN_5}"
+      }
+    }
+  }
+}
