@@ -1,0 +1,23 @@
+{
+  "name": "telegram-bot",
+  "displayName": "Telegram Bot",
+  "version": "0.1.0",
+  "description": "List Telegram bots and check bot details through the Bot API.",
+  "author": { "name": "Enoch Z", "email": "enochzzg@gmail.com" },
+  "license": "MIT",
+  "keywords": ["telegram", "bot", "mcp"],
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/mari0w/telegram-bot-cursor-plugin",
+  "repository": "https://github.com/mari0w/telegram-bot-cursor-plugin",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "TELEGRAM_BOT_TOKEN": { "type": "string", "title": "Default bot token", "description": "Bot 1 token from BotFather." },
+      "TELEGRAM_BOT_TOKEN_2": { "type": "string", "title": "Bot 2 token (optional)", "description": "Bot 2 token from BotFather." },
+      "TELEGRAM_BOT_TOKEN_3": { "type": "string", "title": "Bot 3 token (optional)", "description": "Bot 3 token from BotFather." },
+      "TELEGRAM_BOT_TOKEN_4": { "type": "string", "title": "Bot 4 token (optional)", "description": "Bot 4 token from BotFather." },
+      "TELEGRAM_BOT_TOKEN_5": { "type": "string", "title": "Bot 5 token (optional)", "description": "Bot 5 token from BotFather." }
+    },
+    "required": ["TELEGRAM_BOT_TOKEN"]
+  }
+}
