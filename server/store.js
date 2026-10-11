@@ -11,6 +11,7 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
   const lock = path.join(dir, "poll.lock");
   const makeDir = () => mkdir(dir, { recursive: true, mode: 0o700 });
   return {
+    dir,
     async read() {
       try {
         return JSON.parse(await readFile(file, "utf8"));

@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { loadBots, selectBot } from "./bots.js";
-import { callApi, errorMessage, redact } from "./telegram.js";
+import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
 import { addMessage, addUpdates, openStore } from "./store.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
@@ -20,7 +22,7 @@ function errorResult(error, tokens) {
 }
 
 export function createServer({ env = process.env, fetch, dataDir } = {}) {
-  const server = new McpServer({ name: "telegram-bot", version: "0.3.0" });
+  const server = new McpServer({ name: "telegram-bot", version: "1.0.0" });
   const bots = loadBots(env);
   const tokens = bots.map((entry) => entry.token);
   const usernames = new Map();
@@ -34,25 +36,49 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
 
   const send = async (method, { bot, confirm, ...params }, notice) => {
     try {
+      let source;
+      let localFile;
+      const fileField = method === "sendPhoto" ? "photo" : method === "sendDocument" ? "document" : undefined;
+      if (fileField) {
+        const { file, ...rest } = params;
+        localFile = existsSync(file) ? await stat(file) : undefined;
+        const maxMB = fileField === "photo" ? 10 : 50;
+        if (localFile && localFile.size > maxMB * 1024 * 1024) {
+          throw new Error(`Local ${fileField} exceeds the ${maxMB} MB upload limit (${localFile.size} bytes).`);
+        }
+        source = localFile ? { kind: "local", file_size: localFile.size }
+          : { kind: /^https?:\/\//i.test(file) ? "url" : "file_id" };
+        params = { ...rest, [fileField]: file };
+      }
       const entry = await selectBot(bots, bot, getUsername);
-      const store = openStore(dataDir, entry.id);
+      const savesMessage = ["sendMessage", "editMessageText", "forwardMessage", "sendPhoto", "sendDocument"].includes(method);
+      const store = savesMessage || method === "deleteMessage" ? openStore(dataDir, entry.id) : undefined;
       if (!confirm) {
-        const state = await store.read();
+        const state = store ? await store.read() : undefined;
         return textResult({ sent: false, preview: { bot_id: entry.id,
-          chat: state.chats[params.chat_id]?.chat ?? null, method, params },
+          chat: state?.chats[params.chat_id]?.chat ?? null, method, params, ...(source ? { source } : {}) },
           notice: `${notice} Show this preview to the user. Call again with confirm=true after the user agrees.`,
           rate_reminder: RATE_REMINDER }, tokens);
       }
-      const result = await callApi(entry.token, method, params, { fetch, env });
+      let body = params;
+      if (localFile) {
+        body = new FormData();
+        for (const [key, value] of Object.entries(params)) {
+          if (value === undefined) continue;
+          if (key === fileField) body.append(key, new Blob([await readFile(value)]), path.basename(value));
+          else body.append(key, typeof value === "object" ? JSON.stringify(value) : String(value));
+        }
+      }
+      const result = await callApi(entry.token, method, body, { fetch, env });
       const response = { ...(result === true ? (method === "deleteMessage" ? { deleted: true } : { ok: true }) : result),
         rate_reminder: RATE_REMINDER };
-      try {
+      if (store && (method === "deleteMessage" || result !== true)) try {
         await store.withLock(async () => {
           const state = await store.read();
           if (method === "deleteMessage") {
             const chat = state.chats[params.chat_id];
             if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== params.message_id);
-          } else if (result !== true) {
+          } else {
             addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)), { edited: method === "editMessageText" });
           }
           await store.write(state);
@@ -89,6 +115,66 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     from_chat_id: z.union([z.string(), z.number()]), message_id: z.number().int(),
     disable_notification: z.boolean().optional(),
   }, async (args) => send("forwardMessage", args, "The bot forwards this as itself. Others in the target chat can see it."));
+
+  for (const [name, method, kind, uploadMB, urlMB] of [
+    ["send_photo", "sendPhoto", "photo", 10, 5],
+    ["send_document", "sendDocument", "document", 50, 20],
+  ]) {
+    server.tool(name, `Send a ${kind} as the bot from a local file, HTTP(S) URL, or Telegram file_id. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Caption must be 0-1024 characters after entity parsing. Local upload limit: ${uploadMB} MB. Telegram URL limit: ${urlMB} MB; the plugin does not check URL sizes. On 429, stop and wait retry_after seconds.`, {
+      bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+      file: z.string(), caption: z.string().optional(), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
+      reply_to_message_id: z.number().int().optional(), disable_notification: z.boolean().optional(),
+    }, async ({ reply_to_message_id, ...args }) => send(method, {
+      ...args, ...(reply_to_message_id === undefined ? {} : { reply_parameters: { message_id: reply_to_message_id } }),
+    }, `The bot sends this ${kind} as itself. Others in the chat can see it.`));
+  }
+
+  server.tool("download_file", "Download a Telegram file to the bot's local files directory. Return a local path only. Telegram allows bot downloads up to 20 MB. See https://core.telegram.org/bots/api#getfile.", {
+    bot: botSchema, file_id: z.string(),
+  }, async ({ bot, file_id }) => {
+    try {
+      const entry = await selectBot(bots, bot, getUsername);
+      const file = await callApi(entry.token, "getFile", { file_id }, { fetch, env });
+      const bytes = await downloadFile(entry.token, file.file_path, { fetch, env });
+      const dir = path.join(openStore(dataDir, entry.id).dir, "files");
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      const localPath = path.join(dir, `${file.file_unique_id}_${path.basename(file.file_path)}`);
+      await writeFile(localPath, bytes, { mode: 0o600 });
+      return textResult({ path: localPath, file_size: file.file_size ?? bytes.length, file_path: file.file_path }, tokens);
+    } catch (error) {
+      return errorResult(error, tokens);
+    }
+  });
+
+  for (const [name, method, description, schema] of [
+    ["get_chat", "getChat", "Get current chat details.", { chat_id: z.union([z.string(), z.number()]) }],
+    ["get_chat_admins", "getChatAdministrators", "Get the chat's administrators.", { chat_id: z.union([z.string(), z.number()]) }],
+    ["get_commands", "getMyCommands", "Get the bot's command menu.", {}],
+  ]) {
+    server.tool(name, description, { bot: botSchema, ...schema }, async ({ bot, ...params }) => {
+      try {
+        const entry = await selectBot(bots, bot, getUsername);
+        return textResult(await callApi(entry.token, method, params, { fetch, env }), tokens);
+      } catch (error) {
+        return errorResult(error, tokens);
+      }
+    });
+  }
+
+  server.tool("pin_message", "Pin a chat message. Show a preview first. Set confirm=true only after the user agrees.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    message_id: z.number().int(), disable_notification: z.boolean().optional(),
+  }, async (args) => send("pinChatMessage", args, "The bot pins this message in the chat."));
+
+  server.tool("unpin_message", "Unpin a chat message. Omit message_id to unpin the most recent pinned message. Show a preview first. Set confirm=true only after the user agrees.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    message_id: z.number().int().optional(),
+  }, async (args) => send("unpinChatMessage", args, "The bot removes this pin from the chat."));
+
+  server.tool("set_commands", "Set the bot's command menu. Use at most 100 commands. Each command must have 1-32 characters and a nonempty description. Show a preview first. Set confirm=true only after the user agrees.", {
+    bot: botSchema, confirm: z.boolean().default(false),
+    commands: z.array(z.object({ command: z.string().min(1).max(32), description: z.string().min(1) })).max(100),
+  }, async (args) => send("setMyCommands", args, "The bot changes its command menu."));
 
   server.tool("list_bots", "List configured bots. Return bot IDs and names without tokens.", {}, async () => {
     try {

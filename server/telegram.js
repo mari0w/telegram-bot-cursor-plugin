@@ -16,21 +16,25 @@ export function errorMessage(error, tokens) {
   return redact([error?.message ?? String(error), error?.cause?.message].filter(Boolean).join(": "), tokens);
 }
 
+function dispatcherOptions(env) {
+  const proxyUrl = resolveProxyUrl(env);
+  if (proxyUrl !== cachedProxyUrl) {
+    const nextDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+    proxyDispatcher?.close().catch(() => {});
+    proxyDispatcher = nextDispatcher;
+    cachedProxyUrl = proxyUrl;
+  }
+  return proxyDispatcher ? { dispatcher: proxyDispatcher } : {};
+}
+
 export async function callApi(token, method, params, { fetch = globalThis.fetch, env = process.env, timeoutMs } = {}) {
   try {
-    const proxyUrl = resolveProxyUrl(env);
-    if (proxyUrl !== cachedProxyUrl) {
-      const nextDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
-      proxyDispatcher?.close().catch(() => {});
-      proxyDispatcher = nextDispatcher;
-      cachedProxyUrl = proxyUrl;
-    }
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(params),
+      ...(params instanceof FormData ? { body: params }
+        : { headers: { "content-type": "application/json" }, body: JSON.stringify(params) }),
       ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
-      ...(proxyDispatcher ? { dispatcher: proxyDispatcher } : {}),
+      ...dispatcherOptions(env),
     });
     const body = await response.json();
     if (!body.ok) {
@@ -45,5 +49,18 @@ export async function callApi(token, method, params, { fetch = globalThis.fetch,
     const safeError = new Error(errorMessage(error, [token]));
     safeError.code = error.code;
     throw safeError;
+  }
+}
+
+export async function downloadFile(token, filePath, { fetch = globalThis.fetch, env = process.env, timeoutMs } = {}) {
+  try {
+    const response = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, {
+      ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
+      ...dispatcherOptions(env),
+    });
+    if (!response.ok) throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
+    return Buffer.from(await response.arrayBuffer());
+  } catch (error) {
+    throw new Error(errorMessage(error, [token]));
   }
 }

@@ -1,10 +1,12 @@
 # Telegram Bot
 
-This Cursor plugin uses the Telegram Bot API through an MCP server.
-It lists bots, checks bot details, receives and sends messages, and manages webhooks.
+Version 1.0.0 uses the Telegram Bot API through an MCP server in Cursor.
+It receives, sends, edits, deletes, and forwards messages.
+It sends and downloads files.
+It reads chat details and administrators.
+It manages pins, command menus, and webhooks.
 It uses Bot API only.
 It does not use MTProto or a user login.
-Photo and file sending will come in a later version.
 
 ## Create a bot
 
@@ -19,7 +21,6 @@ See the [BotFather guide](https://core.telegram.org/bots/features#botfather).
 ## Configure tokens
 
 Set tokens in plugin Configure or in the MCP environment.
-Bot 1 (`TELEGRAM_BOT_TOKEN`) is required and is the default bot.
 `TELEGRAM_BOT_TOKEN` sets bot 1 as the default bot.
 Extra bots use `TELEGRAM_BOT_TOKEN_2` through `TELEGRAM_BOT_TOKEN_5`.
 You can set up to five bots.
@@ -62,7 +63,7 @@ Do not paste a token into chat.
 The server removes tokens from errors and error logs.
 The tools do not return tokens.
 
-## Tools in 0.3.0
+## Tools in 1.0.0
 
 | Tool | Use |
 | --- | --- |
@@ -75,6 +76,15 @@ The tools do not return tokens.
 | `edit_message` | Preview and edit message text. |
 | `delete_message` | Preview and delete a message sent less than 48 hours ago. |
 | `forward_message` | Preview and forward a message to a target chat. |
+| `send_photo` | Preview and send a photo from a local file, URL, or Telegram file ID. |
+| `send_document` | Preview and send a document from a local file, URL, or Telegram file ID. |
+| `download_file` | Download a Telegram file and return its local path and file details. |
+| `get_chat` | Get current chat details from Telegram. |
+| `get_chat_admins` | Get the chat's administrators from Telegram. |
+| `pin_message` | Preview and pin a chat message. |
+| `unpin_message` | Preview and unpin a message. Omit `message_id` to remove the most recent pin. |
+| `get_commands` | Get the bot's command menu. |
+| `set_commands` | Preview and set the bot's command menu. |
 | `get_webhook_info` | Get the bot's webhook status. |
 | `delete_webhook` | Show a preview. Remove the webhook with `confirm=true` after the user agrees. |
 
@@ -114,9 +124,96 @@ Do not repeat the action to fix a local save error.
 
 ### The bot cannot start a chat
 
-> Bots can't start conversations with users. A user must either add them to a group or send them a message first.
+The bot cannot start a chat with a user.
+The user must send it a message first or add it to a group.
+See [Telegram bots](https://core.telegram.org/bots).
 
-Source: [Telegram bots](https://core.telegram.org/bots).
+## Send files
+
+Use `send_photo` for photos.
+Use `send_document` for other files.
+Set `file` to an existing local file path, an HTTP(S) URL, or a Telegram `file_id`.
+Use a file ID from a message returned by `read_new_messages` or `get_chat_messages`.
+Use the same bot that received the file ID.
+The server uploads local files with their file names.
+It passes URLs and file IDs to Telegram.
+
+Telegram sets these size limits:
+See [Sending files](https://core.telegram.org/bots/api#sending-files).
+
+| Source | Photo | Other files |
+| --- | --- | --- |
+| Local upload | 10 MB | 50 MB |
+| HTTP(S) URL | 5 MB | 20 MB |
+
+The plugin checks local file size in the preview and before sending.
+It returns an error if the file exceeds the upload limit.
+It does not check URL file size.
+Telegram supports document URLs for PDF and ZIP files.
+See [Sending files](https://core.telegram.org/bots/api#sending-files).
+
+Call the tool without `confirm` to get a preview.
+The preview shows the source, local file size, and send values.
+Show the preview to the user.
+Call the same tool with `confirm=true` only after the user agrees.
+The preview does not send the file.
+Set `caption` to add text.
+Captions must have 0-1024 characters after entity parsing.
+See [sendPhoto](https://core.telegram.org/bots/api#sendphoto) and [sendDocument](https://core.telegram.org/bots/api#senddocument).
+Set `parse_mode` to `HTML` or `MarkdownV2` to format the caption.
+Set `reply_to_message_id` to reply to a message.
+Set `disable_notification=true` to send without a notification sound.
+The server saves the returned message and file details locally.
+
+## Download files
+
+Call `download_file` with the bot and `file_id`.
+This tool does not need `confirm`.
+Telegram allows bot downloads up to 20 MB.
+See [getFile](https://core.telegram.org/bots/api#getfile).
+The tool returns `path`, `file_size`, and Telegram's `file_path`.
+It returns a local path only.
+It does not return the download URL or token.
+The server uses the same proxy settings as other API calls.
+It saves files under `~/.telegram-bot-cursor-plugin/<bot ID>/files/`.
+It prefixes each file name with Telegram's unique file ID to avoid name conflicts.
+It creates the directory with mode `0700` and each file with mode `0600`.
+To clear downloads, delete the bot's `files` directory.
+To clear all saved data, delete the bot directory.
+
+## Chat info and pinning
+
+Call `get_chat` with `chat_id` to get current chat details.
+Call `get_chat_admins` with `chat_id` to get the administrators.
+These tools read from Telegram.
+They do not need `confirm`.
+They do not change local message storage.
+
+Call `pin_message` with `chat_id` and `message_id` to get a preview.
+Set `disable_notification=true` to pin without a notification.
+Call `unpin_message` with `chat_id` and `message_id` to preview removal of a specific pin.
+Omit `message_id` to remove the most recent pinned message.
+Show the preview to the user.
+Call the same tool with `confirm=true` only after the user agrees.
+The bot needs Telegram's required pin permissions.
+See [pinChatMessage](https://core.telegram.org/bots/api#pinchatmessage) and [unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage).
+These actions do not change local message storage.
+
+## Command menu
+
+Call `get_commands` to read the bot's command menu.
+Call `set_commands` with a `commands` array to get a preview.
+Each entry has `command` and `description` fields.
+Use at most 100 commands.
+Use 1-32 characters for each command.
+Use lowercase Latin letters, digits, or underscores without the leading `/`.
+Use a nonempty description.
+See [setMyCommands](https://core.telegram.org/bots/api#setmycommands) and [Commands](https://core.telegram.org/bots/features#commands).
+Show the preview to the user.
+Call `set_commands` with `confirm=true` only after the user agrees.
+Use an empty array to clear the default command menu.
+These tools use the default scope and language.
+They do not change local message storage.
 
 ## Rate limits
 

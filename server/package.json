@@ -1,6 +1,6 @@
 {
   "name": "telegram-bot-mcp-server",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": { "test": "node --test" },
   "author": "Enoch Z",

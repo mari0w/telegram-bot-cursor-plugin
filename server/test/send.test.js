@@ -21,7 +21,7 @@ async function setup(t, reply) {
     calls.push({ url, method, params: JSON.parse(options.body) });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
-  const client = new Client({ name: "send-test", version: "0.3.0" });
+  const client = new Client({ name: "send-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
