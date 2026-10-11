@@ -143,6 +143,14 @@ test("Forward saves messages without update IDs under the target chat", async (t
   assert.equal(await call("get_chat_messages", { chat_id: 7 }), "No saved messages.");
 });
 
+test("Forward rejects a business chat source before calling Telegram", async (t) => {
+  const { call, calls } = await setup(t, () => ({ ok: true, result: { id: 101, username: "bot_101" } }));
+  const result = await call("forward_message", { chat_id: 8, from_chat_id: "BC1:7", message_id: 1, confirm: true });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /forward_message cannot use a business chat as the source.*forwarding from business chats is not supported/);
+  assert.ok(calls.every(({ method }) => method === "getMe"));
+});
+
 test("Bot 202 uses its token and stores messages in its own directory", async (t) => {
   const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: message(1) }));
   const preview = await call("send_message", { bot: "202", chat_id: 7, text: "Second" });

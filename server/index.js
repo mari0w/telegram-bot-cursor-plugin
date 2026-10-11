@@ -49,6 +49,9 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
 
   const send = async (method, { bot, confirm, ...params }, notice) => {
     try {
+      if (method === "forwardMessage" && typeof params.from_chat_id === "string" && /^(.+):(-?\d+)$/.test(params.from_chat_id)) {
+        throw new Error("forward_message cannot use a business chat as the source. Copying the numeric chat id is not enough; forwarding from business chats is not supported.");
+      }
       let source;
       let localFile;
       const fileField = method === "sendPhoto" ? "photo" : method === "sendDocument" ? "document" : undefined;
