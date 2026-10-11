@@ -76,6 +76,9 @@ export function addUpdates(store, updates) {
     entry.messages = entry.messages.slice(-200);
     messages.push(message);
   }
-  if (updates.length) store.offset = Math.max(...updates.map((update) => update.update_id)) + 1;
+  if (updates.length) {
+    store.offset = Math.max(...updates.map((update) => update.update_id)) + 1;
+    store.last_update_at = Math.floor(Date.now() / 1000);
+  }
   return messages;
 }

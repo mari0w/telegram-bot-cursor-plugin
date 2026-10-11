@@ -41,6 +41,13 @@ test("Redact API errors, network messages and causes, and unconfigured tokens", 
   }
 });
 
+test("Redact encoded configured and unconfigured tokens, including lowercase %3a", () => {
+  const encoded = encodeURIComponent(token);
+  const other = encodeURIComponent(`999:${"a".repeat(30)}`);
+  assert.equal(redact(`configured ${encoded}; other ${other} ${other.replace("%3A", "%3a")}`, [token]),
+    "configured [REDACTED]; other [REDACTED] [REDACTED]");
+});
+
 test("An optional request timeout sets the fetch signal", async (t) => {
   const signal = new AbortController().signal;
   t.mock.method(AbortSignal, "timeout", (ms) => { assert.equal(ms, 12000); return signal; });

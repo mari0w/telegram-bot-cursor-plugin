@@ -9,6 +9,7 @@ import { createServer } from "../index.js";
 import { addUpdates, openStore } from "../store.js";
 
 const env = { TELEGRAM_BOT_TOKEN: "101:fake-one", TELEGRAM_BOT_TOKEN_2: "202:fake-two" };
+const allowed_updates = ["message", "edited_message", "channel_post", "edited_channel_post"];
 const update = (id, chat = 7) => ({ update_id: id, message: { message_id: id, date: id,
   chat: { id: chat, type: "private", first_name: "User" }, text: `Message ${id}` } });
 
@@ -59,8 +60,8 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   assert.equal(edited.messages[0].edit_date, 20);
   assert.equal((await call("read_new_messages")).offset, 15);
   assert.deepEqual(calls.map(({ params }) => params), [
-    { offset: 0, timeout: 2, limit: 100 }, { offset: 14, timeout: 0, limit: 100 },
-    { offset: 15, timeout: 0, limit: 100 },
+    { offset: 0, timeout: 2, limit: 100, allowed_updates }, { offset: 14, timeout: 0, limit: 100, allowed_updates },
+    { offset: 15, timeout: 0, limit: 100, allowed_updates },
   ]);
   assert.ok(calls.every(({ signal }) => signal instanceof AbortSignal));
   const saved = await openStore(dataDir, 101).read();
@@ -73,6 +74,33 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   assert.equal((await stat(path.join(dataDir, "101"))).mode & 0o777, 0o700);
   assert.equal((await stat(path.join(dataDir, "101/store.json"))).mode & 0o777, 0o600);
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
+});
+
+test("Receive omits stale or unknown offsets and saves the last update time only for nonempty batches", async (t) => {
+  const now = 2000000;
+  t.mock.method(Date, "now", () => now * 1000);
+  let updates = [];
+  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: updates }));
+  const store = openStore(dataDir, 101);
+  for (const last_update_at of [now - 7 * 24 * 60 * 60 - 1, now - 7 * 24 * 60 * 60,
+    undefined, now - 7 * 24 * 60 * 60 + 1]) {
+    const state = { offset: 100, chats: {}, ...(last_update_at === undefined ? {} : { last_update_at }) };
+    await store.write(state);
+    updates = [];
+    await call("read_new_messages");
+    assert.deepEqual(calls.at(-1).params, { timeout: 0, limit: 100, allowed_updates,
+      ...(last_update_at === now - 7 * 24 * 60 * 60 + 1 ? { offset: 100 } : {}) });
+    assert.deepEqual(await store.read(), state);
+    updates = [update(10)];
+    await call("read_new_messages");
+    const saved = await store.read();
+    assert.equal(saved.offset, 11);
+    assert.equal(saved.last_update_at, now);
+    updates = [];
+    await call("read_new_messages");
+    assert.deepEqual(calls.at(-1).params, { offset: 11, timeout: 0, limit: 100, allowed_updates });
+    assert.deepEqual(await store.read(), saved);
+  }
 });
 
 test("Receive keeps the last 200 messages per chat and reports full batches", async (t) => {

@@ -6,8 +6,10 @@ let proxyDispatcher;
 
 export function redact(text, tokens) {
   let message = String(text);
-  for (const token of tokens) message = message.split(token).join("[REDACTED]");
-  return message.replace(/\d+:[A-Za-z0-9_-]{30,}/g, "[REDACTED]");
+  for (const token of tokens) {
+    message = message.split(token).join("[REDACTED]").split(encodeURIComponent(token)).join("[REDACTED]");
+  }
+  return message.replace(/\d+(?::|%3A)[A-Za-z0-9_-]{30,}/gi, "[REDACTED]");
 }
 
 export function errorMessage(error, tokens) {

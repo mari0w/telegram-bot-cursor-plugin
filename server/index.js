@@ -69,7 +69,12 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       const store = openStore(dataDir, entry.id);
       return await store.withLock(async () => {
         const state = await store.read();
-        const updates = await callApi(entry.token, "getUpdates", { offset: state.offset, timeout, limit: 100 },
+        const resetOffset = state.last_update_at === undefined ? state.offset > 0
+          : Math.floor(Date.now() / 1000) - state.last_update_at >= 7 * 24 * 60 * 60;
+        const updates = await callApi(entry.token, "getUpdates", {
+          ...(resetOffset ? {} : { offset: state.offset }), timeout, limit: 100,
+          allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
+        },
           { fetch, env, timeoutMs: (timeout + 10) * 1000 });
         const messages = addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
         await store.write(state);
