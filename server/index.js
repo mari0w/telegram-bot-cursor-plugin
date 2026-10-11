@@ -6,15 +6,22 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { loadBots, selectBot } from "./bots.js";
+import { businessStatus, loadBots, selectBot } from "./bots.js";
 import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
-import { addMessage, addUpdates, openStore } from "./store.js";
+import { addBusinessConnection, addMessage, addUpdates, chatKey, openStore } from "./store.js";
+import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages,
+  ownerNamesHint, previewFilterImpact, readFilters, writeFilters } from "./filter.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
+const UPDATE_CALL_LIMIT = 20;
 const RATE_REMINDER = "Reminder: Telegram limits: in one chat, avoid more than 1 message per second; in one group, no more than 20 messages per minute; for bulk notifications, about 30 messages per second at most. Over the limit, Telegram returns 429 with retry_after. Bots that share one token share these limits.";
 
 function textResult(obj, tokens = []) {
-  return { content: [{ type: "text", text: redact(JSON.stringify(obj, null, 2), tokens) }] };
+  return plainTextResult(JSON.stringify(obj, null, 2), tokens);
+}
+
+function plainTextResult(text, tokens = []) {
+  return { content: [{ type: "text", text: redact(text, tokens) }] };
 }
 
 function errorResult(error, tokens) {
@@ -22,7 +29,7 @@ function errorResult(error, tokens) {
 }
 
 export function createServer({ env = process.env, fetch, dataDir } = {}) {
-  const server = new McpServer({ name: "telegram-bot", version: "1.0.0" });
+  const server = new McpServer({ name: "telegram-bot", version: "1.1.0" });
   const bots = loadBots(env);
   const tokens = bots.map((entry) => entry.token);
   const usernames = new Map();
@@ -33,9 +40,18 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
   };
   const getUsername = async (entry) => usernames.has(entry.number)
     ? usernames.get(entry.number) : (await getMe(entry)).username;
+  const filterMe = async (entry, state) => {
+    const owners = Object.values(state.business ?? {});
+    return { id: entry.id, username: await getUsername(entry),
+      owner_ids: owners.map((owner) => owner.user_id).filter((id) => id !== undefined),
+      owner_usernames: owners.map((owner) => owner.user_username).filter(Boolean) };
+  };
 
   const send = async (method, { bot, confirm, ...params }, notice) => {
     try {
+      if (method === "forwardMessage" && typeof params.from_chat_id === "string" && /^(.+):(-?\d+)$/.test(params.from_chat_id)) {
+        throw new Error("forward_message cannot use a business chat as the source. Copying the numeric chat id is not enough; forwarding from business chats is not supported.");
+      }
       let source;
       let localFile;
       const fileField = method === "sendPhoto" ? "photo" : method === "sendDocument" ? "document" : undefined;
@@ -52,11 +68,25 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       }
       const entry = await selectBot(bots, bot, getUsername);
       const savesMessage = ["sendMessage", "editMessageText", "forwardMessage", "sendPhoto", "sendDocument"].includes(method);
-      const store = savesMessage || method === "deleteMessage" ? openStore(dataDir, entry.id) : undefined;
+      const deletesMessage = method === "deleteMessage";
+      const store = openStore(dataDir, entry.id);
+      const state = await store.read();
+      const { chat_id: key, message_id } = params;
+      const businessChat = typeof key === "string" && key.match(/^(.+):(-?\d+)$/);
+      if (businessChat && method === "forwardMessage") {
+        params = { ...params, chat_id: Number(businessChat[2]) };
+      } else if (businessChat && (deletesMessage || state.business?.[businessChat[1]])) {
+        if (deletesMessage) {
+          method = "deleteBusinessMessages";
+          params = { business_connection_id: businessChat[1], message_ids: [message_id] };
+        } else {
+          params = { ...params, business_connection_id: businessChat[1], chat_id: Number(businessChat[2]) };
+          notice = "这条会以你本人的身份发送。";
+        }
+      }
       if (!confirm) {
-        const state = store ? await store.read() : undefined;
         return textResult({ sent: false, preview: { bot_id: entry.id,
-          chat: state?.chats[params.chat_id]?.chat ?? null, method, params, ...(source ? { source } : {}) },
+          chat: state.chats[key]?.chat ?? null, method, params, ...(source ? { source } : {}) },
           notice: `${notice} Show this preview to the user. Call again with confirm=true after the user agrees.`,
           rate_reminder: RATE_REMINDER }, tokens);
       }
@@ -71,16 +101,17 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       }
       const result = await callApi(entry.token, method, body,
         { fetch, env, ...(body instanceof FormData ? { timeoutMs: 120000 } : {}) });
-      const response = { ...(result === true ? (method === "deleteMessage" ? { deleted: true } : { ok: true }) : result),
+      const response = { ...(result === true ? (deletesMessage ? { deleted: true } : { ok: true }) : result),
         rate_reminder: RATE_REMINDER };
-      if (store && (method === "deleteMessage" || result !== true)) try {
+      if (deletesMessage || (savesMessage && result !== true)) try {
         await store.withLock(async () => {
           const state = await store.read();
-          if (method === "deleteMessage") {
-            const chat = state.chats[params.chat_id];
-            if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== params.message_id);
+          if (deletesMessage) {
+            const chat = state.chats[key];
+            if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== message_id);
           } else {
-            addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)), { edited: method === "editMessageText" });
+            addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)),
+              { edited: method === "editMessageText", outgoing: true });
           }
           await store.write(state);
         });
@@ -93,7 +124,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     }
   };
 
-  server.tool("send_message", "Send text as the bot. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
+  server.tool("send_message", "Send text as the bot. For a business chat key, send as the owner. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
     bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
     text: z.string().min(1), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
     reply_to_message_id: z.number().int().optional(), disable_notification: z.boolean().optional(),
@@ -101,7 +132,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     ...args, ...(reply_to_message_id === undefined ? {} : { reply_parameters: { message_id: reply_to_message_id } }),
   }, "The bot sends this as itself. Others in the chat can see it."));
 
-  server.tool("edit_message", "Edit message text. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
+  server.tool("edit_message", "Edit message text. For a business chat key, edit as the owner. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
     bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
     message_id: z.number().int(), text: z.string().min(1), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
   }, async (args) => send("editMessageText", args, "The bot edits this message. Others in the chat can see the change."));
@@ -121,7 +152,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     ["send_photo", "sendPhoto", "photo", 10, 5],
     ["send_document", "sendDocument", "document", 50, 20],
   ]) {
-    server.tool(name, `Send a ${kind} as the bot from a local file, HTTP(S) URL, or Telegram file_id. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Caption must be 0-1024 characters after entity parsing. Local upload limit: ${uploadMB} MB. Telegram URL limit: ${urlMB} MB; the plugin does not check URL sizes. On 429, stop and wait retry_after seconds.`, {
+    server.tool(name, `Send a ${kind} as the bot from a local file, HTTP(S) URL, or Telegram file_id. For a business chat key, send as the owner. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Caption must be 0-1024 characters after entity parsing. Local upload limit: ${uploadMB} MB. Telegram URL limit: ${urlMB} MB; the plugin does not check URL sizes. On 429, stop and wait retry_after seconds.`, {
       bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
       file: z.string(), caption: z.string().optional(), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
       reply_to_message_id: z.number().int().optional(), disable_notification: z.boolean().optional(),
@@ -183,49 +214,103 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       for (const entry of bots) {
         const info = { number: entry.number, id: entry.id, default: entry.default };
         try {
-          const { username, first_name } = await getMe(entry);
-          results.push({ ...info, username, first_name, ok: true });
+          const me = await getMe(entry);
+          const { can_connect_to_business, can_read_all_group_messages, missing_steps, next_step } =
+            businessStatus(me, await openStore(dataDir, entry.id).read());
+          results.push({ ...info, username: me.username, first_name: me.first_name, ok: true,
+            can_connect_to_business, can_read_all_group_messages, missing_steps, next_step });
         } catch (error) {
           results.push({ ...info, ok: false, error: errorMessage(error, tokens) });
         }
       }
-      return textResult(results);
+      return textResult(results, tokens);
     } catch (error) {
       return errorResult(error, tokens);
     }
   });
 
-  server.tool("get_me", "Get the selected bot's details.", {
+  server.tool("get_me", "Get the selected bot's details and missing setup steps. Refresh known business connections.", {
     bot: botSchema,
   }, async ({ bot }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
-      const { id, username, first_name, can_join_groups, can_read_all_group_messages, supports_inline_queries } = await getMe(entry);
-      return textResult({ id, username, first_name, can_join_groups, can_read_all_group_messages,
-        supports_inline_queries, number: entry.number, default: entry.default });
+      const me = await getMe(entry);
+      const store = openStore(dataDir, entry.id);
+      const status = await store.withLock(async () => {
+        const state = await store.read();
+        const ids = Object.keys(state.business ?? {});
+        for (const business_connection_id of ids) {
+          const connection = await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
+          addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
+        }
+        if (ids.length) await store.write(state);
+        return businessStatus(me, state);
+      });
+      const { id, username, first_name, can_join_groups, supports_inline_queries } = me;
+      return textResult({ id, username, first_name, can_join_groups, supports_inline_queries,
+        ...status, number: entry.number, default: entry.default }, tokens);
     } catch (error) {
       return errorResult(error, tokens);
     }
   });
-  server.tool("read_new_messages", "Read new messages once and save them. Telegram keeps updates for 24 hours only.", {
+  server.tool("read_new_messages", "Fetch and save new updates in batches of 100, up to 20 calls. Show the next page of saved incoming messages. Set limit from 1 to 1000 (default 200). Only the first fetch uses timeout. Call again while updates or saved messages are waiting. Omit mode to use the saved default_mode (initially all). Mode all shows every readable incoming message in full. Mode for_me shows private chats, bot and owner @mentions and replies, allowed chats, allowed users, and include matches in full. Other group messages show one summary line per group. Both modes apply local filters and the 500-character cut. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept unless an exclude_rules item has include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only. Never mark messages as read. Telegram keeps updates for 24 hours only.", {
     bot: botSchema, timeout: z.number().int().min(0).max(50).default(0),
-  }, async ({ bot, timeout }) => {
+    limit: z.number().int().min(1).max(1000).default(200),
+    mode: z.enum(["all", "for_me"]).optional(),
+  }, async ({ bot, timeout, limit, mode }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
       return await store.withLock(async () => {
         const state = await store.read();
+        await getUsername(entry);
         const resetOffset = state.last_update_at === undefined ? state.offset > 0
           : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
-        const updates = await callApi(entry.token, "getUpdates", {
-          ...(resetOffset ? {} : { offset: state.offset }), timeout, limit: 100,
-          allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post"],
-        },
-          { fetch, env, timeoutMs: (timeout + 10) * 1000 });
-        const messages = addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
+        let more = false;
+        const checkedConnections = new Set();
+        for (let batch = 0; batch < UPDATE_CALL_LIMIT; batch++) {
+          const wait = batch === 0 ? timeout : 0;
+          const updates = await callApi(entry.token, "getUpdates", {
+            ...(batch === 0 && resetOffset ? {} : { offset: state.offset }), timeout: wait, limit: 100,
+            allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
+              "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
+          }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
+          const connectionIds = new Set(updates.map((update) => (update.business_message
+            ?? update.edited_business_message ?? update.deleted_business_messages)?.business_connection_id).filter(Boolean));
+          for (const business_connection_id of connectionIds) {
+            if (state.business?.[business_connection_id]?.user_id !== undefined || checkedConnections.has(business_connection_id)) continue;
+            checkedConnections.add(business_connection_id);
+            let connection;
+            try {
+              connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
+                ?? await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
+            } catch (error) {
+              return errorResult(error, tokens);
+            }
+            addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
+          }
+          addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
+          await store.write(state);
+          more = updates.length === 100;
+          if (!more) break;
+        }
+        state.pending = state.pending.filter(([key, id]) =>
+          state.chats[key]?.messages.some((message) => message.message_id === id));
+        const me = await filterMe(entry, state);
+        const rules = await readFilters(store.dir);
+        const priority = (message) => {
+          const chat = state.chats[chatKey(message.chat_id, message.business_connection_id)].chat;
+          return chat.type === "private" || classify(message, chat, rules, me, "for_me") === "full";
+        };
+        const messages = state.pending.map(([key, id]) =>
+          state.chats[key].messages.find((message) => message.message_id === id))
+          .sort((a, b) => Number(priority(b)) - Number(priority(a))).slice(0, limit);
+        const shown = new Set(messages.map((message) => `${chatKey(message.chat_id, message.business_connection_id)}:${message.message_id}`));
+        state.pending = state.pending.filter(([key, id]) => !shown.has(`${key}:${id}`));
+        const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
+          offset: state.offset, more, mode, pending: state.pending }), tokens);
         await store.write(state);
-        return textResult({ bot_id: entry.id, count: messages.length, messages,
-          offset: state.offset, more: updates.length === 100 }, tokens);
+        return result;
       });
     } catch (error) {
       if (error.code === 409) {
@@ -235,30 +320,107 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     }
   });
 
-  server.tool("get_chat_messages", "Read saved messages for one chat. Return the oldest message first.", {
+  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
     bot: botSchema, chat_id: z.union([z.string(), z.number()]),
     limit: z.number().int().min(1).max(200).default(20), before_message_id: z.number().int().optional(),
-  }, async ({ bot, chat_id, limit, before_message_id }) => {
+    message_id: z.number().int().optional(), context: z.number().int().min(0).max(50).default(5),
+    show_filtered: z.boolean().default(false),
+  }, async ({ bot, chat_id, limit, before_message_id, message_id, context, show_filtered }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
-      const state = await openStore(dataDir, entry.id).read();
-      const chat = state.chats[chat_id];
-      const messages = (chat?.messages ?? []).filter((message) =>
-        before_message_id === undefined || message.message_id < before_message_id)
-        .sort((a, b) => a.message_id - b.message_id).slice(-limit);
-      return textResult({ chat: chat?.chat ?? null, messages }, tokens);
+      const store = openStore(dataDir, entry.id);
+      return await store.withLock(async () => {
+        const state = await store.read();
+        const rules = await readFilters(store.dir);
+        const chat = state.chats[chat_id];
+        const saved = (chat?.messages ?? []).slice().sort((a, b) => a.message_id - b.message_id);
+        let messages;
+        const lines = [];
+        if (message_id !== undefined) {
+          const index = saved.findIndex((message) => message.message_id === message_id);
+          messages = index === -1 ? [] : saved.slice(Math.max(0, index - context), index + context + 1)
+            .map((message) => ({ message, prefix: message.message_id === message_id ? "→ " : "" }));
+          const replyId = saved[index]?.reply_to_message_id;
+          if (replyId !== undefined) {
+            const original = saved.find((message) => message.message_id === replyId);
+            if (!original) lines.push("原消息没有保存在本地。");
+            else if (!messages.some(({ message }) => message.message_id === replyId)) {
+              messages.unshift({ message: original, prefix: "原消息：" });
+            }
+          }
+        } else {
+          messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
+            .slice(-limit).map((message) => ({ message, prefix: "" }));
+        }
+        const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
+        const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
+        lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
+        if (!lines.length) lines.push("No saved messages.");
+        const hidden = messages.length - visible.length;
+        if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
+        const shown = new Set(visible.map(({ message }) => message.message_id));
+        state.pending = state.pending.filter(([key, id]) => key !== String(chat_id) || !shown.has(id));
+        await store.write(state);
+        return plainTextResult(lines.join("\n"), tokens);
+      });
     } catch (error) {
       return errorResult(error, tokens);
     }
   });
 
-  server.tool("list_chats", "List saved chats. Return the newest chat first.", { bot: botSchema }, async ({ bot }) => {
+  server.tool("get_filters", "Read the bot's message filter config. The result is for the AI. When you explain rules to the owner, use everyday language.", { bot: botSchema }, async ({ bot }) => {
+    try {
+      const entry = await selectBot(bots, bot, getUsername);
+      return textResult(await readFilters(openStore(dataDir, entry.id).dir), tokens);
+    } catch (error) {
+      return errorResult(error, tokens);
+    }
+  });
+
+  server.tool("set_filters", "The owner must approve every add, change, or delete of a rule. Call without confirm first. Show the preview text to the owner as is. Point out the messages that might be hidden by mistake. Call with confirm=true only after the owner clearly agrees. Never add rules on your own. Read real saved messages with get_chat_messages first. Use specific rules: require several words or limit a rule to a chat or sender. Talk to the owner in everyday language. Do not mention technical words (regex, JSON, chat_id, file paths). Given fields replace saved fields. Omitted fields keep their saved value. Call get_filters first and pass the full new list. Protected words and messages for the owner are kept by default.", {
+    bot: botSchema, confirm: z.boolean().default(false),
+    default_mode: z.enum(["all", "for_me"]).optional(),
+    ...Object.fromEntries(filterFields.filter((key) => key !== "exclude_rules").map((key) => [key, z.array(key.endsWith("chats") || key.endsWith("users")
+      ? z.union([z.string(), z.number()]) : z.string()).optional()])),
+    exclude_rules: z.array(z.object({ words: z.array(z.string()).optional(), pattern: z.string().optional(),
+      chats: z.array(z.union([z.string(), z.number()])).optional(),
+      users: z.array(z.union([z.string(), z.number()])).optional(), include_for_me: z.boolean().optional(),
+    })).optional(),
+  }, async ({ bot, confirm, ...fields }) => {
+    try {
+      const entry = await selectBot(bots, bot, getUsername);
+      const store = openStore(dataDir, entry.id);
+      const current = await readFilters(store.dir);
+      const next = { ...current, ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)) };
+      for (const source of [...next.exclude_regex, ...next.include_regex,
+        ...next.exclude_rules.map((rule) => rule.pattern).filter((pattern) => pattern !== undefined)]) new RegExp(source, "i");
+      const state = await store.read();
+      const { chats } = state;
+      const summary = describeFilterChanges(current, next, chats);
+      if (!summary) return plainTextResult("规则没有变化。", tokens);
+      if (!confirm) {
+        const me = await filterMe(entry, state);
+        const hint = (current.default_mode ?? "all") !== next.default_mode ? ownerNamesHint(next, me) : "";
+        return plainTextResult(`${summary}\n${previewFilterImpact(current, next, chats, me)}\n要保存这条规则吗？\n`
+          + "AI: Show the text above to the owner. Call again with confirm=true only after the owner clearly agrees. Do not add rules by yourself. Point out the messages that might be hidden by mistake."
+          + (hint ? `\n${hint}` : ""), tokens);
+      }
+      await writeFilters(store.dir, next);
+      return plainTextResult(`已保存。\n${summary}\n如果有消息被误收，直接告诉我，我再改规则（改之前也会先问你）。`, tokens);
+    } catch (error) {
+      return errorResult(error, tokens);
+    }
+  });
+
+  server.tool("list_chats", "List saved chats. Return the newest chat first. Use chat_key for business chat history and send tools.", { bot: botSchema }, async ({ bot }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const state = await openStore(dataDir, entry.id).read();
-      return textResult(Object.values(state.chats).map(({ chat, messages }) => ({ ...chat,
-        message_count: messages.length, last_message_date: Math.max(...messages.map((message) => message.date)),
-      })).sort((a, b) => b.last_message_date - a.last_message_date), tokens);
+      return textResult(Object.entries(state.chats).map(([chat_key, { chat, messages, business_connection_id, left }]) => ({ ...chat,
+        chat_key, ...(business_connection_id ? { id: chat_key, business_connection_id } : {}),
+        message_count: messages.length, last_message_date: messages.length ? Math.max(...messages.map((message) => message.date)) : null,
+        ...(left ? { left: true } : {}),
+      })).sort((a, b) => (b.last_message_date ?? -1) - (a.last_message_date ?? -1)), tokens);
     } catch (error) {
       return errorResult(error, tokens);
     }

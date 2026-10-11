@@ -25,7 +25,7 @@ async function setup(t, reply, extraEnv = {}) {
     calls.push({ url, method, params, options });
     return reply(calls.at(-1));
   } });
-  const client = new Client({ name: "files-chat-test", version: "1.0.0" });
+  const client = new Client({ name: "files-chat-test", version: "1.1.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
@@ -96,7 +96,9 @@ test("Local upload limits apply to previews and are checked again before sending
 
 test("Document URLs and photo file IDs preview their source and send JSON strings", async (t) => {
   const timeout = t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
-  const { call, calls, dataDir } = await setup(t, ({ method }) => api(message(method === "sendDocument" ? "document" : "photo")));
+  const { call, calls, dataDir } = await setup(t, ({ method }) => api({
+    ...message(method === "sendDocument" ? "document" : "photo"), message_id: method === "sendDocument" ? 1 : 2,
+  }));
   for (const [name, field, file, kind] of [
     ["send_document", "document", "https://example.com/file.pdf", "url"],
     ["send_photo", "photo", "telegram-photo-id", "file_id"],

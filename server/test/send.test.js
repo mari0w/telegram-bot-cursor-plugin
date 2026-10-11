@@ -21,7 +21,7 @@ async function setup(t, reply) {
     calls.push({ url, method, params: JSON.parse(options.body) });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
-  const client = new Client({ name: "send-test", version: "1.0.0" });
+  const client = new Client({ name: "send-test", version: "1.1.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
@@ -29,7 +29,8 @@ async function setup(t, reply) {
   return { dataDir, calls, call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     for (const token of Object.values(env)) assert.ok(!JSON.stringify(result).includes(token));
-    return result.isError ? result : JSON.parse(result.content[0].text);
+    return result.isError ? result : ["read_new_messages", "get_chat_messages"].includes(name)
+      ? result.content[0].text : JSON.parse(result.content[0].text);
   } };
 }
 
@@ -65,27 +66,44 @@ test("All message tools need confirmation and preview saved or unknown chats wit
   assert.ok(calls.every(({ method }) => method === "getMe"));
 });
 
+test("A getMe failure on the first read leaves the offset unchanged and does not poll", async (t) => {
+  const { call, calls, dataDir } = await setup(t, (method) => method === "getMe"
+    ? { ok: false, error_code: 401, description: "Unauthorized" }
+    : { ok: true, result: [{ update_id: 10, message: message(10) }] });
+  const store = openStore(dataDir, 101);
+  const state = { offset: 7, last_update_at: Math.floor(Date.now() / 1000), chats: {}, pending: [] };
+  await store.write(state);
+  const result = await call("read_new_messages");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Telegram API getMe failed: 401 Unauthorized/);
+  assert.deepEqual(calls.map(({ method }) => method), ["getMe"]);
+  assert.deepEqual(await store.read(), state);
+});
+
 test("Send maps reply parameters and saves both sides of the chat", async (t) => {
   const incoming = { ...message(1, 7, "Incoming"), from: { id: 9, is_bot: false, first_name: "User" } };
   const sent = message(2, 7, "<b>Hello</b>");
   const { call, calls, dataDir } = await setup(t, (method) => ({ ok: true,
-    result: method === "getUpdates" ? [{ update_id: 1, message: incoming }] : sent }));
+    result: method === "getMe" ? { id: 101, username: "my_bot" }
+      : method === "getUpdates" ? [{ update_id: 1, message: incoming }] : sent }));
   await call("read_new_messages");
   const result = await call("send_message", { chat_id: 7, text: sent.text, parse_mode: "HTML",
     reply_to_message_id: 1, disable_notification: false, confirm: true });
   assert.deepEqual(result, { ...sent, rate_reminder: result.rate_reminder });
   assert.ok(result.rate_reminder);
-  assert.equal(calls.length, 2);
-  assert.equal(calls[1].method, "sendMessage");
-  assert.deepEqual(calls[1].params, { chat_id: 7, text: sent.text, parse_mode: "HTML",
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].method, "sendMessage");
+  assert.deepEqual(calls[2].params, { chat_id: 7, text: sent.text, parse_mode: "HTML",
     reply_parameters: { message_id: 1 }, disable_notification: false });
-  const saved = await call("get_chat_messages", { chat_id: 7 });
+  assert.match(await call("get_chat_messages", { chat_id: 7 }), /Incoming[\s\S]*<b>Hello<\/b>/);
+  const saved = (await openStore(dataDir, 101).read()).chats[7];
   assert.deepEqual(saved.messages.map(({ text, from }) => [text, from.is_bot]), [["Incoming", false], [sent.text, true]]);
   assert.equal((await openStore(dataDir, 101).read()).offset, 2);
+  assert.deepEqual((await openStore(dataDir, 101).read()).pending, []);
 });
 
 test("Edit replaces saved text and delete removes the saved message", async (t) => {
-  const { call, calls } = await setup(t, (method, params) => ({ ok: true,
+  const { call, calls, dataDir } = await setup(t, (method, params) => ({ ok: true,
     result: method === "deleteMessage" ? true : { ...message(2, 7, params.text),
       ...(method === "editMessageText" ? { edit_date: 3 } : {}) } }));
   await call("send_message", { chat_id: "7", text: "Original", confirm: true });
@@ -95,7 +113,8 @@ test("Edit replaces saved text and delete removes the saved message", async (t) 
   assert.ok(edit.rate_reminder);
   assert.equal(calls[1].method, "editMessageText");
   assert.deepEqual(calls[1].params, { chat_id: 7, message_id: 2, text: "Changed", parse_mode: "MarkdownV2" });
-  const saved = (await call("get_chat_messages", { chat_id: 7 })).messages;
+  assert.match(await call("get_chat_messages", { chat_id: 7 }), /\(edited\).*Changed/);
+  const saved = (await openStore(dataDir, 101).read()).chats[7].messages;
   assert.equal(saved.length, 1);
   assert.equal(saved[0].text, "Changed");
   assert.equal(saved[0].edited, true);
@@ -103,14 +122,15 @@ test("Edit replaces saved text and delete removes the saved message", async (t) 
   const deleted = await call("delete_message", { chat_id: 7, message_id: 2, confirm: true });
   assert.equal(deleted.deleted, true);
   assert.ok(deleted.rate_reminder);
-  assert.equal(calls[2].method, "deleteMessage");
-  assert.deepEqual(calls[2].params, { chat_id: 7, message_id: 2 });
-  assert.deepEqual((await call("get_chat_messages", { chat_id: 7 })).messages, []);
+  assert.equal(calls.at(-1).method, "deleteMessage");
+  assert.deepEqual(calls.at(-1).params, { chat_id: 7, message_id: 2 });
+  assert.equal(await call("get_chat_messages", { chat_id: 7 }), "No saved messages.");
+  assert.deepEqual((await openStore(dataDir, 101).read()).chats[7].messages, []);
 });
 
 test("Forward saves messages without update IDs under the target chat", async (t) => {
   let id = 0;
-  const { call, calls } = await setup(t, (method, params) => ({ ok: true,
+  const { call, calls, dataDir } = await setup(t, (method, params) => ({ ok: true,
     result: message(++id, params.chat_id, "Forwarded") }));
   for (const extra of [{ disable_notification: true }, {}]) {
     const result = await call("forward_message", { chat_id: 8, from_chat_id: 7, message_id: 10, ...extra, confirm: true });
@@ -118,8 +138,17 @@ test("Forward saves messages without update IDs under the target chat", async (t
     assert.equal(calls.at(-1).method, "forwardMessage");
     assert.deepEqual(calls.at(-1).params, { chat_id: 8, from_chat_id: 7, message_id: 10, ...extra });
   }
-  assert.equal((await call("get_chat_messages", { chat_id: 8 })).messages.length, 2);
-  assert.deepEqual((await call("get_chat_messages", { chat_id: 7 })).messages, []);
+  assert.equal((await openStore(dataDir, 101).read()).chats[8].messages.length, 2);
+  assert.equal((await call("get_chat_messages", { chat_id: 8 })).split("\n").length, 2);
+  assert.equal(await call("get_chat_messages", { chat_id: 7 }), "No saved messages.");
+});
+
+test("Forward rejects a business chat source before calling Telegram", async (t) => {
+  const { call, calls } = await setup(t, () => ({ ok: true, result: { id: 101, username: "bot_101" } }));
+  const result = await call("forward_message", { chat_id: 8, from_chat_id: "BC1:7", message_id: 1, confirm: true });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /forward_message cannot use a business chat as the source.*forwarding from business chats is not supported/);
+  assert.ok(calls.every(({ method }) => method === "getMe"));
 });
 
 test("Bot 202 uses its token and stores messages in its own directory", async (t) => {
@@ -130,7 +159,7 @@ test("Bot 202 uses its token and stores messages in its own directory", async (t
   await call("send_message", { bot: "202", chat_id: 7, text: "Second", confirm: true });
   assert.equal(calls[0].url, `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN_2}/sendMessage`);
   assert.equal((await openStore(dataDir, 202).read()).chats[7].messages.length, 1);
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {} });
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });
 
 test("API errors redact both tokens and tell the caller to wait on 429", async (t) => {
@@ -152,5 +181,5 @@ test("A store lock failure preserves API success and does not overwrite the stor
   assert.match(result.store_error, /Another process is reading messages/);
   assert.equal(calls.length, 1);
   assert.equal(await readFile(lock, "utf8"), "Locked");
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {} });
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });

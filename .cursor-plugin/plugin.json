@@ -1,7 +1,7 @@
 {
   "name": "telegram-bot",
   "displayName": "Telegram Bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Use the Telegram Bot API to list bots, receive, send, edit, delete, and forward messages, send and download files, read chats and administrators, pin messages, set command menus, and manage webhooks.",
   "author": { "name": "Enoch Z", "email": "enochzzg@gmail.com" },
   "license": "MIT",

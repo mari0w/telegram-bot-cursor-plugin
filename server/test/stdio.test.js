@@ -5,7 +5,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-test("Stdio exposes the 1.0.0 tools with no tokens", { timeout: 10000 }, async (t) => {
+test("Stdio exposes the 1.1.0 tools with no tokens", { timeout: 10000 }, async (t) => {
   const env = { ...process.env };
   for (let n = 1; n <= 5; n++) env[`TELEGRAM_BOT_TOKEN${n === 1 ? "" : `_${n}`}`] = "";
   const child = spawn(process.execPath, [fileURLToPath(new URL("../index.js", import.meta.url))], {
@@ -24,15 +24,15 @@ test("Stdio exposes the 1.0.0 tools with no tokens", { timeout: 10000 }, async (
     return JSON.parse(value);
   };
   send({ id: 1, method: "initialize", params: { protocolVersion: "2024-11-05",
-    capabilities: {}, clientInfo: { name: "stdio-test", version: "1.0.0" } } });
-  assert.deepEqual((await receive()).result.serverInfo, { name: "telegram-bot", version: "1.0.0" });
+    capabilities: {}, clientInfo: { name: "stdio-test", version: "1.1.0" } } });
+  assert.deepEqual((await receive()).result.serverInfo, { name: "telegram-bot", version: "1.1.0" });
   send({ method: "notifications/initialized" });
   send({ id: 2, method: "tools/list", params: {} });
   assert.deepEqual((await receive()).result.tools.map((tool) => tool.name).sort(), [
     "delete_message", "delete_webhook", "download_file", "edit_message", "forward_message", "get_chat",
-    "get_chat_admins", "get_chat_messages", "get_commands", "get_me", "get_webhook_info", "list_bots",
+    "get_chat_admins", "get_chat_messages", "get_commands", "get_filters", "get_me", "get_webhook_info", "list_bots",
     "list_chats", "pin_message", "read_new_messages", "send_document", "send_message", "send_photo",
-    "set_commands", "unpin_message",
+    "set_commands", "set_filters", "unpin_message",
   ]);
   assert.equal(stderr, "");
 });
