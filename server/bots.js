@@ -4,7 +4,7 @@ export function loadBots(env) {
     const suffix = number === 1 ? "" : `_${number}`;
     const token = env[`TELEGRAM_BOT_TOKEN${suffix}`]?.trim();
     if (!token || /^\$\{[^}]*\}$/.test(token)) continue;
-    bots.push({ number, token, id: token.split(":")[0], default: number === 1 });
+    bots.push({ number, token, id: token.match(/^(\d+):/)?.[1] ?? "", default: number === 1 });
   }
   return bots;
 }
@@ -21,7 +21,12 @@ export async function selectBot(bots, bot, getUsername) {
   const byId = bots.find((entry) => entry.id === name);
   if (byId) return byId;
   for (const entry of bots) {
-    const username = await getUsername(entry);
+    let username;
+    try {
+      username = await getUsername(entry);
+    } catch {
+      continue;
+    }
     if (username && username.toLowerCase() === name) return entry;
   }
   throw new Error(`Unknown bot. Configured bot IDs: ${bots.map((entry) => entry.id).join(", ") || "none"}.`);

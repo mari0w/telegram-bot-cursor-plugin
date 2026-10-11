@@ -63,7 +63,13 @@ export function createServer({ env = process.env, fetch } = {}) {
 
 if (process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])) {
   const tokens = loadBots(process.env).map((entry) => entry.token);
-  process.on("unhandledRejection", (error) => console.error(errorMessage(error, tokens)));
-  process.on("uncaughtException", (error) => console.error(errorMessage(error, tokens)));
+  process.on("unhandledRejection", (error) => {
+    console.error(errorMessage(error, tokens));
+    process.exit(1);
+  });
+  process.on("uncaughtException", (error) => {
+    console.error(errorMessage(error, tokens));
+    process.exit(1);
+  });
   await createServer().connect(new StdioServerTransport());
 }

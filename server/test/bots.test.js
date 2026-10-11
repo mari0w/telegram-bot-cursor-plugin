@@ -25,6 +25,25 @@ test("Select default, numeric ID without lookup, and username with case and @", 
   }
 });
 
+test("Token without a colon has an empty ID and is absent from unknown-bot errors", async () => {
+  const token = "secretwithoutcolon";
+  const bots = loadBots({ TELEGRAM_BOT_TOKEN: token });
+  assert.equal(bots[0].id, "");
+  await assert.rejects(selectBot(bots, "unknown", async () => "first_bot"), (error) => {
+    assert.equal(error.message, "Unknown bot. Configured bot IDs: none.");
+    assert.ok(!error.message.includes(token));
+    return true;
+  });
+});
+
+test("Username lookup continues after a bot lookup fails", async () => {
+  const bots = loadBots(env);
+  assert.equal(await selectBot(bots, "second_bot", async (entry) => {
+    if (entry.number === 1) throw new Error("Lookup failed");
+    return "second_bot";
+  }), bots[1]);
+});
+
 test("Unknown bot has no fallback or token; missing default names its setting", async () => {
   await assert.rejects(selectBot(loadBots(env), env.TELEGRAM_BOT_TOKEN, async () => "first_bot"), (error) => {
     assert.equal(error.message, "Unknown bot. Configured bot IDs: 101, 202.");
