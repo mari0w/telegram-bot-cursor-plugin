@@ -277,11 +277,14 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           for (const business_connection_id of connectionIds) {
             if (state.business?.[business_connection_id]?.user_id !== undefined || checkedConnections.has(business_connection_id)) continue;
             checkedConnections.add(business_connection_id);
+            let connection;
             try {
-              const connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
+              connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
                 ?? await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
-              addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
-            } catch { /* Keep polling if the connection lookup fails. */ }
+            } catch (error) {
+              return errorResult(error, tokens);
+            }
+            addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
           }
           addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
           await store.write(state);

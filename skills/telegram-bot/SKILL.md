@@ -227,7 +227,7 @@ Use `delete_message` to remove a message.
 Use `forward_message` to send a message to a target chat.
 Use the preview and agreement flow for each action.
 The bot sends as itself in normal bot chats.
-It sends as the owner in business chats.
+It sends as the owner in business chats, except `forward_message`, which sends as the bot and does not use `business_connection_id`.
 Others in the chat can see the message.
 Set `parse_mode` to `HTML` or `MarkdownV2` for send or edit.
 Omit it for plain text.
@@ -248,7 +248,7 @@ See [Telegram bots](https://core.telegram.org/bots).
 Use `send_photo` for photos.
 Use `send_document` for other files.
 Set `file` to an existing local file path, an HTTP(S) URL, or a Telegram `file_id`.
-Use a file ID from the bot's `store.json`.
+For `download_file` or reuse, take the file ID from `id=...` in the file marker in the compact text returned by `read_new_messages` / `get_chat_messages`.
 Use the same bot that received the file ID.
 Use the preview and agreement flow before sending.
 The preview shows the source and local file size.
