@@ -1,10 +1,10 @@
 # Telegram Bot
 
 This Cursor plugin uses the Telegram Bot API through an MCP server.
-It lists bots, checks bot details, receives messages, and manages webhooks.
+It lists bots, checks bot details, receives and sends messages, and manages webhooks.
 It uses Bot API only.
 It does not use MTProto or a user login.
-Sending tools will come in later versions.
+Photo and file sending will come in a later version.
 
 ## Create a bot
 
@@ -62,7 +62,7 @@ Do not paste a token into chat.
 The server removes tokens from errors and error logs.
 The tools do not return tokens.
 
-## Tools in 0.2.0
+## Tools in 0.3.0
 
 | Tool | Use |
 | --- | --- |
@@ -71,6 +71,10 @@ The tools do not return tokens.
 | `read_new_messages` | Read new messages once and save them. Set `timeout` to 0–50 seconds. |
 | `list_chats` | List saved chats, with the newest chat first. |
 | `get_chat_messages` | Read recent saved messages for one chat. Use `limit` and `before_message_id` to select messages. |
+| `send_message` | Preview and send text as the bot. |
+| `edit_message` | Preview and edit message text. |
+| `delete_message` | Preview and delete a message sent less than 48 hours ago. |
+| `forward_message` | Preview and forward a message to a target chat. |
 | `get_webhook_info` | Get the bot's webhook status. |
 | `delete_webhook` | Show a preview. Remove the webhook with `confirm=true` after the user agrees. |
 
@@ -84,6 +88,51 @@ It acknowledges other update types and does not store them.
 If `more` is true, call it again to read more updates.
 Call `list_chats` to find saved chats.
 Call `get_chat_messages` to read messages for one chat.
+
+## Send messages
+
+Read the chat with `get_chat_messages` first.
+Call the send, edit, delete, or forward tool without `confirm` to get a preview.
+Show the preview to the user.
+Call the same tool with `confirm=true` only after the user agrees.
+The bot sends as itself.
+Others in the chat can see the message.
+Set `parse_mode` to `HTML` or `MarkdownV2` for send or edit.
+Omit `parse_mode` for plain text.
+The plugin does not offer legacy `Markdown`.
+Set `reply_to_message_id` to reply to a message.
+The plugin sends this value in `reply_parameters.message_id`.
+Text must be 1-4096 characters after entity parsing.
+See [sendMessage](https://core.telegram.org/bots/api#sendmessage).
+Telegram can delete only messages sent less than 48 hours ago.
+See [deleteMessage](https://core.telegram.org/bots/api#deletemessage).
+Sent, edited, and forwarded messages are saved locally.
+Thus, `get_chat_messages` shows both sides of the chat.
+Deleted messages are removed from local storage.
+If the result has `store_error`, the Telegram action succeeded but the local save failed.
+Do not repeat the action to fix a local save error.
+
+### The bot cannot start a chat
+
+> Bots can't start conversations with users. A user must either add them to a group or send them a message first.
+
+Source: [Telegram bots](https://core.telegram.org/bots).
+
+## Rate limits
+
+Remind the user of these limits before bursts or bulk sends:
+
+- In one chat, avoid more than 1 message per second. Short bursts can be allowed, but Telegram eventually returns 429.
+- In one group, send no more than 20 messages per minute.
+- For bulk notifications, send no more than about 30 messages per second, unless paid broadcasts are used.
+
+See the [Telegram rate limits FAQ](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this).
+On 429, stop sending.
+Wait `parameters.retry_after` seconds before sending again.
+See [ResponseParameters](https://core.telegram.org/bots/api#responseparameters).
+The plugin does not throttle sends.
+It reminds the user of the limits.
+Bots that share one token share these limits.
 
 ## Webhook and getUpdates
 

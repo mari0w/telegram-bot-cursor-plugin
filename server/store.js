@@ -46,35 +46,38 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
   };
 }
 
+export function addMessage(store, source, { update_id, edited = false } = {}) {
+  const entry = store.chats[source.chat.id] ??= { chat: {}, messages: [] };
+  if (update_id !== undefined && entry.messages.some((message) => message.update_id === update_id)) return;
+  entry.chat = pick(source.chat, ["id", "type", "title", "username", "first_name", "last_name"]);
+  const message = { ...pick({ update_id }, ["update_id"]), ...pick(source, ["message_id", "date", "edit_date"]),
+    chat_id: source.chat.id };
+  if (source.from) message.from = pick(source.from, ["id", "is_bot", "username", "first_name", "last_name"]);
+  if (source.text !== undefined || source.caption !== undefined) message.text = source.text ?? source.caption;
+  const kind = ["photo", "animation", "document", "video", "audio", "voice", "sticker", "video_note"]
+    .find((key) => source[key]);
+  if (kind) {
+    const file = kind === "photo" ? source.photo.reduce((a, b) =>
+      a.width * a.height > b.width * b.height ? a : b) : source[kind];
+    message.file = { kind, ...pick(file, ["file_id", "file_name", "file_size", "mime_type"]) };
+  }
+  if (source.reply_to_message) message.reply_to_message_id = source.reply_to_message.message_id;
+  if (edited) message.edited = true;
+  const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
+  if (index === -1) entry.messages.push(message);
+  else entry.messages[index] = message;
+  entry.messages = entry.messages.slice(-200);
+  return message;
+}
+
 export function addUpdates(store, updates) {
   const messages = [];
   for (const update of updates) {
     const type = ["message", "edited_message", "channel_post", "edited_channel_post"]
       .find((key) => update[key]);
     if (!type) continue;
-    const source = update[type];
-    const entry = store.chats[source.chat.id] ??= { chat: {}, messages: [] };
-    if (entry.messages.some((message) => message.update_id === update.update_id)) continue;
-    entry.chat = pick(source.chat, ["id", "type", "title", "username", "first_name", "last_name"]);
-    const message = { update_id: update.update_id, ...pick(source, ["message_id", "date", "edit_date"]),
-      chat_id: source.chat.id };
-    if (source.from) message.from = pick(source.from, ["id", "is_bot", "username", "first_name", "last_name"]);
-    if (source.text !== undefined || source.caption !== undefined) message.text = source.text ?? source.caption;
-    const kind = ["photo", "animation", "document", "video", "audio", "voice", "sticker", "video_note"]
-      .find((key) => source[key]);
-    if (kind) {
-      const file = kind === "photo" ? source.photo.reduce((a, b) =>
-        a.width * a.height > b.width * b.height ? a : b) : source[kind];
-      message.file = { kind, ...pick(file, ["file_id", "file_name", "file_size", "mime_type"]) };
-    }
-    if (source.reply_to_message) message.reply_to_message_id = source.reply_to_message.message_id;
-    const edited = type.startsWith("edited_");
-    if (edited) message.edited = true;
-    const index = edited ? entry.messages.findIndex((item) => item.message_id === message.message_id) : -1;
-    if (index === -1) entry.messages.push(message);
-    else entry.messages[index] = message;
-    entry.messages = entry.messages.slice(-200);
-    messages.push(message);
+    const message = addMessage(store, update[type], { update_id: update.update_id, edited: type.startsWith("edited_") });
+    if (message) messages.push(message);
   }
   if (updates.length) {
     store.offset = Math.max(...updates.map((update) => update.update_id)) + 1;

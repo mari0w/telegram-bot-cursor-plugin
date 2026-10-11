@@ -6,9 +6,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadBots, selectBot } from "./bots.js";
 import { callApi, errorMessage, redact } from "./telegram.js";
-import { addUpdates, openStore } from "./store.js";
+import { addMessage, addUpdates, openStore } from "./store.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
+const RATE_REMINDER = "Reminder: Telegram limits: in one chat, avoid more than 1 message per second; in one group, no more than 20 messages per minute; for bulk notifications, about 30 messages per second at most. Over the limit, Telegram returns 429 with retry_after. Bots that share one token share these limits.";
 
 function textResult(obj, tokens = []) {
   return { content: [{ type: "text", text: redact(JSON.stringify(obj, null, 2), tokens) }] };
@@ -19,7 +20,7 @@ function errorResult(error, tokens) {
 }
 
 export function createServer({ env = process.env, fetch, dataDir } = {}) {
-  const server = new McpServer({ name: "telegram-bot", version: "0.2.0" });
+  const server = new McpServer({ name: "telegram-bot", version: "0.3.0" });
   const bots = loadBots(env);
   const tokens = bots.map((entry) => entry.token);
   const usernames = new Map();
@@ -30,6 +31,64 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
   };
   const getUsername = async (entry) => usernames.has(entry.number)
     ? usernames.get(entry.number) : (await getMe(entry)).username;
+
+  const send = async (method, { bot, confirm, ...params }, notice) => {
+    try {
+      const entry = await selectBot(bots, bot, getUsername);
+      const store = openStore(dataDir, entry.id);
+      if (!confirm) {
+        const state = await store.read();
+        return textResult({ sent: false, preview: { bot_id: entry.id,
+          chat: state.chats[params.chat_id]?.chat ?? null, method, params },
+          notice: `${notice} Show this preview to the user. Call again with confirm=true after the user agrees.`,
+          rate_reminder: RATE_REMINDER }, tokens);
+      }
+      const result = await callApi(entry.token, method, params, { fetch, env });
+      const response = { ...(result === true ? (method === "deleteMessage" ? { deleted: true } : { ok: true }) : result),
+        rate_reminder: RATE_REMINDER };
+      try {
+        await store.withLock(async () => {
+          const state = await store.read();
+          if (method === "deleteMessage") {
+            const chat = state.chats[params.chat_id];
+            if (chat) chat.messages = chat.messages.filter((message) => message.message_id !== params.message_id);
+          } else if (result !== true) {
+            addMessage(state, JSON.parse(redact(JSON.stringify(result), tokens)), { edited: method === "editMessageText" });
+          }
+          await store.write(state);
+        });
+      } catch (error) {
+        response.store_error = errorMessage(error, tokens);
+      }
+      return textResult(response, tokens);
+    } catch (error) {
+      return errorResult(error, tokens);
+    }
+  };
+
+  server.tool("send_message", "Send text as the bot. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    text: z.string().min(1), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
+    reply_to_message_id: z.number().int().optional(), disable_notification: z.boolean().optional(),
+  }, async ({ reply_to_message_id, ...args }) => send("sendMessage", {
+    ...args, ...(reply_to_message_id === undefined ? {} : { reply_parameters: { message_id: reply_to_message_id } }),
+  }, "The bot sends this as itself. Others in the chat can see it."));
+
+  server.tool("edit_message", "Edit message text. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. Text must be 1-4096 characters after entity parsing. On 429, stop and wait retry_after seconds.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    message_id: z.number().int(), text: z.string().min(1), parse_mode: z.enum(["HTML", "MarkdownV2"]).optional(),
+  }, async (args) => send("editMessageText", args, "The bot edits this message. Others in the chat can see the change."));
+
+  server.tool("delete_message", "Delete a message. Telegram can delete only messages sent less than 48 hours ago. Show a preview first. Set confirm=true only after the user agrees.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    message_id: z.number().int(),
+  }, async (args) => send("deleteMessage", args, "The bot deletes this message. The message is removed from the chat."));
+
+  server.tool("forward_message", "Forward a message to a chat as the bot. Show a preview first. Set confirm=true only after the user agrees. Remind the user of rate limits before bursts or bulk sends. On 429, stop and wait retry_after seconds.", {
+    bot: botSchema, confirm: z.boolean().default(false), chat_id: z.union([z.string(), z.number()]),
+    from_chat_id: z.union([z.string(), z.number()]), message_id: z.number().int(),
+    disable_notification: z.boolean().optional(),
+  }, async (args) => send("forwardMessage", args, "The bot forwards this as itself. Others in the target chat can see it."));
 
   server.tool("list_bots", "List configured bots. Return bot IDs and names without tokens.", {}, async () => {
     try {

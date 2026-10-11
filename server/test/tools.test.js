@@ -16,7 +16,7 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
       can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false,
       token: env.TELEGRAM_BOT_TOKEN } }) };
   } });
-  const client = new Client({ name: "test", version: "0.2.0" });
+  const client = new Client({ name: "test", version: "0.3.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); });
   await server.connect(serverTransport);
