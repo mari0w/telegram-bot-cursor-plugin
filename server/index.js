@@ -8,12 +8,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { businessStatus, loadBots, selectBot } from "./bots.js";
 import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
-import { addBusinessConnection, addMessage, addUpdates, chatKey, openStore } from "./store.js";
+import { addBusinessConnection, addMessage, chatKey, openStore } from "./store.js";
+import { startPoller } from "./poll.js";
 import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages,
   ownerNamesHint, previewFilterImpact, readFilters, writeFilters } from "./filter.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
-const UPDATE_CALL_LIMIT = 20;
 const RATE_REMINDER = "Reminder: Telegram limits: in one chat, avoid more than 1 message per second; in one group, no more than 20 messages per minute; for bulk notifications, about 30 messages per second at most. Over the limit, Telegram returns 429 with retry_after. Bots that share one token share these limits.";
 
 function textResult(obj, tokens = []) {
@@ -24,25 +24,45 @@ function plainTextResult(text, tokens = []) {
   return { content: [{ type: "text", text: redact(text, tokens) }] };
 }
 
-function errorResult(error, tokens) {
-  return { content: [{ type: "text", text: `Error: ${errorMessage(error, tokens)}` }], isError: true };
+function pollError(state) {
+  return state.last_poll_error ? { poll_error: state.last_poll_error,
+    ...(state.last_poll_error_at === undefined ? {} : { poll_error_at: state.last_poll_error_at }) } : {};
 }
 
-export function createServer({ env = process.env, fetch, dataDir } = {}) {
-  const server = new McpServer({ name: "telegram-bot", version: "1.1.0" });
+function errorResult(error, tokens, fields = {}) {
+  const extra = Object.keys(fields).length ? `\n${JSON.stringify(fields, null, 2)}` : "";
+  return { ...plainTextResult(`Error: ${errorMessage(error, tokens)}${extra}`, tokens), isError: true };
+}
+
+export function createServer({ env = process.env, fetch, dataDir, pollEnabled } = {}) {
+  const server = new McpServer({ name: "telegram-bot", version: "1.2.0" });
   const bots = loadBots(env);
   const tokens = bots.map((entry) => entry.token);
   const usernames = new Map();
   const getMe = async (entry) => {
     const result = await callApi(entry.token, "getMe", {}, { fetch, env });
     usernames.set(entry.number, result.username);
+    const store = openStore(dataDir, entry.id);
+    await store.withLock(async () => {
+      const state = await store.read();
+      state.bot_username = redact(result.username ?? "", tokens);
+      await store.write(state);
+    });
     return result;
   };
-  const getUsername = async (entry) => usernames.has(entry.number)
-    ? usernames.get(entry.number) : (await getMe(entry)).username;
-  const filterMe = async (entry, state) => {
+  const getUsername = async (entry, allowMissing = false) => {
+    if (usernames.has(entry.number)) return usernames.get(entry.number);
+    try { return (await getMe(entry)).username; }
+    catch (error) {
+      const state = await openStore(dataDir, entry.id).read();
+      if (state.bot_username !== undefined) return state.bot_username;
+      if (allowMissing) return "";
+      throw error;
+    }
+  };
+  const filterMe = async (entry, state, username) => {
     const owners = Object.values(state.business ?? {});
-    return { id: entry.id, username: await getUsername(entry),
+    return { id: entry.id, username: username ?? await getUsername(entry, true),
       owner_ids: owners.map((owner) => owner.user_id).filter((id) => id !== undefined),
       owner_usernames: owners.map((owner) => owner.user_username).filter(Boolean) };
   };
@@ -212,7 +232,8 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     try {
       const results = [];
       for (const entry of bots) {
-        const info = { number: entry.number, id: entry.id, default: entry.default };
+        const state = await openStore(dataDir, entry.id).read();
+        const info = { number: entry.number, id: entry.id, default: entry.default, ...pollError(state) };
         try {
           const me = await getMe(entry);
           const { can_connect_to_business, can_read_all_group_messages, missing_steps, next_step } =
@@ -232,10 +253,11 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
   server.tool("get_me", "Get the selected bot's details and missing setup steps. Refresh known business connections.", {
     bot: botSchema,
   }, async ({ bot }) => {
+    let store;
     try {
       const entry = await selectBot(bots, bot, getUsername);
+      store = openStore(dataDir, entry.id);
       const me = await getMe(entry);
-      const store = openStore(dataDir, entry.id);
       const status = await store.withLock(async () => {
         const state = await store.read();
         const ids = Object.keys(state.business ?? {});
@@ -244,59 +266,29 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
         }
         if (ids.length) await store.write(state);
-        return businessStatus(me, state);
+        return { ...businessStatus(me, state), ...pollError(state) };
       });
       const { id, username, first_name, can_join_groups, supports_inline_queries } = me;
       return textResult({ id, username, first_name, can_join_groups, supports_inline_queries,
         ...status, number: entry.number, default: entry.default }, tokens);
     } catch (error) {
-      return errorResult(error, tokens);
+      return errorResult(error, tokens, store ? pollError(await store.read()) : {});
     }
   });
-  server.tool("read_new_messages", "Fetch and save new updates in batches of 100, up to 20 calls. Show the next page of saved incoming messages. Set limit from 1 to 1000 (default 200). Only the first fetch uses timeout. Call again while updates or saved messages are waiting. Omit mode to use the saved default_mode (initially all). Mode all shows every readable incoming message in full. Mode for_me shows private chats, bot and owner @mentions and replies, allowed chats, allowed users, and include matches in full. Other group messages show one summary line per group. Both modes apply local filters and the 500-character cut. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept unless an exclude_rules item has include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only. Never mark messages as read. Telegram keeps updates for 24 hours only.", {
+  server.tool("read_new_messages", "The background fetcher saves new Telegram messages. Show one page of local incoming messages that are not yet summarized. This tool never fetches Telegram updates. It never marks messages as read on Telegram. Set limit from 1 to 1000. The default is 200. The timeout field is kept for compatibility. It does not wait for Telegram. Call again while local messages are waiting. Omit mode to use the saved default. The initial mode is all. Mode all shows every readable incoming message in full. Mode for_me shows private messages, @mentions, and replies in full. Mentions and replies to the bot or owner count. Allowed chats, allowed users, and include matches also show in full. Other group messages show one count line per group. Both modes apply local filters. Text is cut at 500 characters. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept by default. An exclude_rules item can hide them with include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only.", {
     bot: botSchema, timeout: z.number().int().min(0).max(50).default(0),
     limit: z.number().int().min(1).max(1000).default(200),
     mode: z.enum(["all", "for_me"]).optional(),
-  }, async ({ bot, timeout, limit, mode }) => {
+  }, async ({ bot, limit, mode }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
+      const username = await getUsername(entry, true);
       return await store.withLock(async () => {
         const state = await store.read();
-        await getUsername(entry);
-        const resetOffset = state.last_update_at === undefined ? state.offset > 0
-          : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
-        let more = false;
-        const checkedConnections = new Set();
-        for (let batch = 0; batch < UPDATE_CALL_LIMIT; batch++) {
-          const wait = batch === 0 ? timeout : 0;
-          const updates = await callApi(entry.token, "getUpdates", {
-            ...(batch === 0 && resetOffset ? {} : { offset: state.offset }), timeout: wait, limit: 100,
-            allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
-              "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
-          }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
-          const connectionIds = new Set(updates.map((update) => (update.business_message
-            ?? update.edited_business_message ?? update.deleted_business_messages)?.business_connection_id).filter(Boolean));
-          for (const business_connection_id of connectionIds) {
-            if (state.business?.[business_connection_id]?.user_id !== undefined || checkedConnections.has(business_connection_id)) continue;
-            checkedConnections.add(business_connection_id);
-            let connection;
-            try {
-              connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
-                ?? await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
-            } catch (error) {
-              return errorResult(error, tokens);
-            }
-            addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
-          }
-          addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
-          await store.write(state);
-          more = updates.length === 100;
-          if (!more) break;
-        }
         state.pending = state.pending.filter(([key, id]) =>
           state.chats[key]?.messages.some((message) => message.message_id === id));
-        const me = await filterMe(entry, state);
+        const me = await filterMe(entry, state, username);
         const rules = await readFilters(store.dir);
         const priority = (message) => {
           const chat = state.chats[chatKey(message.chat_id, message.business_connection_id)].chat;
@@ -307,20 +299,19 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           .sort((a, b) => Number(priority(b)) - Number(priority(a))).slice(0, limit);
         const shown = new Set(messages.map((message) => `${chatKey(message.chat_id, message.business_connection_id)}:${message.message_id}`));
         state.pending = state.pending.filter(([key, id]) => !shown.has(`${key}:${id}`));
+        const notice = state.last_poll_error
+          ? `\n后台获取失败。Background fetch failed: ${state.last_poll_error}\n本地“没有新消息”可能已过时。Local "no new messages" may be stale.` : "";
         const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
-          offset: state.offset, more, mode, pending: state.pending }), tokens);
+          offset: state.offset, mode, pending: state.pending }) + notice, tokens);
         await store.write(state);
         return result;
       });
     } catch (error) {
-      if (error.code === 409) {
-        error = new Error(`Telegram returned 409 Conflict. A webhook is set for this bot, or another process polls this bot. Call get_webhook_info to check. Call delete_webhook with confirm=true to remove the webhook. ${errorMessage(error, tokens)}`);
-      }
       return errorResult(error, tokens);
     }
   });
 
-  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
+  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. This does not change new message progress. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
     bot: botSchema, chat_id: z.union([z.string(), z.number()]),
     limit: z.number().int().min(1).max(200).default(20), before_message_id: z.number().int().optional(),
     message_id: z.number().int().optional(), context: z.number().int().min(0).max(50).default(5),
@@ -329,6 +320,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
+      const username = show_filtered ? "" : await getUsername(entry, true);
       return await store.withLock(async () => {
         const state = await store.read();
         const rules = await readFilters(store.dir);
@@ -352,15 +344,12 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
           messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
             .slice(-limit).map((message) => ({ message, prefix: "" }));
         }
-        const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
+        const me = messages.length && !show_filtered ? await filterMe(entry, state, username) : {};
         const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
         lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
         if (!lines.length) lines.push("No saved messages.");
         const hidden = messages.length - visible.length;
         if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
-        const shown = new Set(visible.map(({ message }) => message.message_id));
-        state.pending = state.pending.filter(([key, id]) => key !== String(chat_id) || !shown.has(id));
-        await store.write(state);
         return plainTextResult(lines.join("\n"), tokens);
       });
     } catch (error) {
@@ -449,6 +438,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       return errorResult(error, tokens);
     }
   });
+  startPoller(server, bots, { pollEnabled, env, fetch, dataDir, tokens });
   return server;
 }
 

@@ -12,7 +12,7 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
   const env = { TELEGRAM_BOT_TOKEN: "101:fake-one", TELEGRAM_BOT_TOKEN_2: "202:fake-two" };
   let calls = 0;
   let fail = false;
-  const server = createServer({ env, dataDir, fetch: async (url) => {
+  const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url) => {
     calls++;
     if (fail) throw new Error(Object.values(env).join(" "));
     const id = url.includes(env.TELEGRAM_BOT_TOKEN_2) ? 202 : 101;
@@ -20,7 +20,7 @@ test("Tools return safe fields, cache usernames, and return redacted errors", as
       can_join_groups: true, can_read_all_group_messages: false, supports_inline_queries: false,
       token: env.TELEGRAM_BOT_TOKEN } }) };
   } });
-  const client = new Client({ name: "test", version: "1.1.0" });
+  const client = new Client({ name: "test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);

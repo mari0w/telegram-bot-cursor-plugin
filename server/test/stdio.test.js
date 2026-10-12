@@ -5,8 +5,8 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-test("Stdio exposes the 1.1.0 tools with no tokens", { timeout: 10000 }, async (t) => {
-  const env = { ...process.env };
+test("Stdio exposes the 1.2.0 tools with no tokens", { timeout: 10000 }, async (t) => {
+  const env = { ...process.env, TELEGRAM_POLL_ENABLED: "off" };
   for (let n = 1; n <= 5; n++) env[`TELEGRAM_BOT_TOKEN${n === 1 ? "" : `_${n}`}`] = "";
   const child = spawn(process.execPath, [fileURLToPath(new URL("../index.js", import.meta.url))], {
     env, stdio: ["pipe", "pipe", "pipe"],
@@ -24,8 +24,8 @@ test("Stdio exposes the 1.1.0 tools with no tokens", { timeout: 10000 }, async (
     return JSON.parse(value);
   };
   send({ id: 1, method: "initialize", params: { protocolVersion: "2024-11-05",
-    capabilities: {}, clientInfo: { name: "stdio-test", version: "1.1.0" } } });
-  assert.deepEqual((await receive()).result.serverInfo, { name: "telegram-bot", version: "1.1.0" });
+    capabilities: {}, clientInfo: { name: "stdio-test", version: "1.2.0" } } });
+  assert.deepEqual((await receive()).result.serverInfo, { name: "telegram-bot", version: "1.2.0" });
   send({ method: "notifications/initialized" });
   send({ id: 2, method: "tools/list", params: {} });
   assert.deepEqual((await receive()).result.tools.map((tool) => tool.name).sort(), [

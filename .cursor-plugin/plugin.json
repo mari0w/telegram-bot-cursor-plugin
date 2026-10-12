@@ -1,7 +1,7 @@
 {
   "name": "telegram-bot",
   "displayName": "Telegram Bot",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Use the Telegram Bot API to list bots, receive, send, edit, delete, and forward messages, send and download files, read chats and administrators, pin messages, set command menus, and manage webhooks.",
   "author": { "name": "Enoch Z", "email": "enochzzg@gmail.com" },
   "license": "MIT",
@@ -16,7 +16,17 @@
       "TELEGRAM_BOT_TOKEN_2": { "type": "string", "title": "Bot 2 token (optional)", "description": "Bot 2 token from BotFather." },
       "TELEGRAM_BOT_TOKEN_3": { "type": "string", "title": "Bot 3 token (optional)", "description": "Bot 3 token from BotFather." },
       "TELEGRAM_BOT_TOKEN_4": { "type": "string", "title": "Bot 4 token (optional)", "description": "Bot 4 token from BotFather." },
-      "TELEGRAM_BOT_TOKEN_5": { "type": "string", "title": "Bot 5 token (optional)", "description": "Bot 5 token from BotFather." }
+      "TELEGRAM_BOT_TOKEN_5": { "type": "string", "title": "Bot 5 token (optional)", "description": "Bot 5 token from BotFather." },
+      "TELEGRAM_POLL_ENABLED": {
+        "type": "string",
+        "title": "Background fetch (optional)",
+        "description": "Leave blank to fetch new messages automatically. Set off to stop fetching."
+      },
+      "TELEGRAM_POLL_INTERVAL_SEC": {
+        "type": "string",
+        "title": "Fetch interval in seconds (optional)",
+        "description": "Leave blank for 120 seconds (2 minutes). Use 30 to 600 seconds."
+      }
     },
     "required": ["TELEGRAM_BOT_TOKEN"]
   }

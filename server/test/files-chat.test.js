@@ -18,14 +18,14 @@ const message = (kind) => ({ message_id: 1, date: 1, chat: { id: 7, type: "priva
 async function setup(t, reply, extraEnv = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-files-chat-"));
   const calls = [];
-  const server = createServer({ env: { ...env, ...extraEnv }, dataDir, fetch: async (url, options) => {
+  const server = createServer({ pollEnabled: false, env: { ...env, ...extraEnv }, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
     const params = options.body instanceof FormData ? options.body
       : options.body === undefined ? undefined : JSON.parse(options.body);
     calls.push({ url, method, params, options });
     return reply(calls.at(-1));
   } });
-  const client = new Client({ name: "files-chat-test", version: "1.1.0" });
+  const client = new Client({ name: "files-chat-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
@@ -163,7 +163,7 @@ test("Download gets file info and saves bytes privately under the selected bot w
   assert.equal(calls[1].options.dispatcher, calls[0].options.dispatcher);
   for (const dir of ["202", "202/files"]) assert.equal((await stat(path.join(dataDir, dir))).mode & 0o777, 0o700);
   assert.equal((await stat(result.path)).mode & 0o777, 0o600);
-  await assert.rejects(readFile(path.join(dataDir, "202/store.json")), { code: "ENOENT" });
+  await assert.rejects(readFile(path.join(dataDir, "202/store.sqlite")), { code: "ENOENT" });
 });
 
 test("Download errors redact tokens from fetch messages and causes", async (t) => {
@@ -226,7 +226,7 @@ test("Pins and command changes require confirmation and do not write the store",
     assert.equal(calls.at(-1).method, method);
     assert.deepEqual(calls.at(-1).params, params);
   }
-  assert.deepEqual(await readdir(dataDir), []);
+  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });
 
 test("Command schema enforces 1-32 characters, nonempty descriptions, and at most 100 commands", async (t) => {

@@ -16,17 +16,17 @@ const message = (id, chat = 7, text = "Sent") => ({ message_id: id, date: id,
 async function setup(t, reply) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-send-"));
   const calls = [];
-  const server = createServer({ env, dataDir, fetch: async (url, options) => {
+  const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
     calls.push({ url, method, params: JSON.parse(options.body) });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
-  const client = new Client({ name: "send-test", version: "1.1.0" });
+  const client = new Client({ name: "send-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
-  return { dataDir, calls, call: async (name, args = {}) => {
+  return { dataDir, calls, pollOnce: () => server.pollOnce("101"), call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     for (const token of Object.values(env)) assert.ok(!JSON.stringify(result).includes(token));
     return result.isError ? result : ["read_new_messages", "get_chat_messages"].includes(name)
@@ -66,16 +66,15 @@ test("All message tools need confirmation and preview saved or unknown chats wit
   assert.ok(calls.every(({ method }) => method === "getMe"));
 });
 
-test("A getMe failure on the first read leaves the offset unchanged and does not poll", async (t) => {
+test("A getMe failure on the first local read still returns an empty page without polling", async (t) => {
   const { call, calls, dataDir } = await setup(t, (method) => method === "getMe"
     ? { ok: false, error_code: 401, description: "Unauthorized" }
     : { ok: true, result: [{ update_id: 10, message: message(10) }] });
   const store = openStore(dataDir, 101);
   const state = { offset: 7, last_update_at: Math.floor(Date.now() / 1000), chats: {}, pending: [] };
   await store.write(state);
-  const result = await call("read_new_messages");
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /Telegram API getMe failed: 401 Unauthorized/);
+  const result = await call("read_new_messages", { bot: "101" });
+  assert.match(result, /no new messages/);
   assert.deepEqual(calls.map(({ method }) => method), ["getMe"]);
   assert.deepEqual(await store.read(), state);
 });
@@ -83,9 +82,10 @@ test("A getMe failure on the first read leaves the offset unchanged and does not
 test("Send maps reply parameters and saves both sides of the chat", async (t) => {
   const incoming = { ...message(1, 7, "Incoming"), from: { id: 9, is_bot: false, first_name: "User" } };
   const sent = message(2, 7, "<b>Hello</b>");
-  const { call, calls, dataDir } = await setup(t, (method) => ({ ok: true,
+  const { pollOnce, call, calls, dataDir } = await setup(t, (method) => ({ ok: true,
     result: method === "getMe" ? { id: 101, username: "my_bot" }
       : method === "getUpdates" ? [{ update_id: 1, message: incoming }] : sent }));
+  await pollOnce();
   await call("read_new_messages");
   const result = await call("send_message", { chat_id: 7, text: sent.text, parse_mode: "HTML",
     reply_to_message_id: 1, disable_notification: false, confirm: true });
