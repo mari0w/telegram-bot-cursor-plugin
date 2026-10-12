@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER="$ROOT/server"
 cd "$SERVER"
-if [[ ! -d node_modules/@modelcontextprotocol/sdk ]]; then
+if [[ ! -d node_modules/@modelcontextprotocol/sdk || ! -f node_modules/sql.js/dist/sql-wasm.wasm ]]; then
   if [[ -n "${SAND_EGRESS_TUNNEL_PROXY_ADDR:-}" && -z "${HTTPS_PROXY:-}" ]]; then
     proxy="$SAND_EGRESS_TUNNEL_PROXY_ADDR"
     [[ "$proxy" == *://* ]] || proxy="http://$proxy"

@@ -17,18 +17,18 @@ const update = (id, chat = 7) => ({ update_id: id, message: { message_id: id, da
 async function setup(t, reply) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-store-"));
   const calls = [];
-  const server = createServer({ env, dataDir, fetch: async (url, options) => {
+  const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
     if (method === "getMe") return { json: async () => ({ ok: true, result: { id: 101, username: "my_bot" } }) };
     calls.push({ method, params: JSON.parse(options.body), signal: options.signal });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
-  const client = new Client({ name: "receive-test", version: "1.1.0" });
+  const client = new Client({ name: "receive-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
-  return { dataDir, calls, call: async (name, args = {}) => {
+  return { dataDir, calls, pollOnce: () => server.pollOnce("101"), call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     for (const token of Object.values(env)) assert.ok(!JSON.stringify(result).includes(token));
     return result.isError ? result : ["read_new_messages", "get_chat_messages", "set_filters"].includes(name)
@@ -48,7 +48,8 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   incoming.message.text = env.TELEGRAM_BOT_TOKEN_2;
   const edit = { update_id: 14, edited_message: { ...first.message, text: "Edited", edit_date: 20 } };
   const batches = [[incoming, first, { update_id: 13, callback_query: { data: "raw" } }], [first, edit], []];
-  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: batches.shift() }));
+  const { pollOnce, call, calls, dataDir } = await setup(t, () => ({ ok: true, result: batches.shift() }));
+  await pollOnce();
   const result = await call("read_new_messages", { timeout: 2 });
   assert.match(result, /bot 101: 2 new messages\. offset 14\./);
   assert.match(result, /\[photo id=large\]/);
@@ -56,13 +57,15 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   assert.deepEqual(firstSaved, { update_id: 10, message_id: 10, date: 10, chat_id: 7,
     from: { id: 9, is_bot: false, first_name: "User" }, text: "Message 10",
     file: { kind: "photo", file_id: "large", file_size: 99 }, reply_to_message_id: 3, reply_to_from_id: 101 });
+  await pollOnce();
   const edited = await call("read_new_messages");
   assert.match(edited, /1 new messages.*offset 15/);
   assert.match(edited, /\(edited\)/);
   assert.equal((await openStore(dataDir, 101).read()).chats[7].messages[1].edit_date, 20);
+  await pollOnce();
   assert.match(await call("read_new_messages"), /no new messages/);
   assert.deepEqual(calls.map(({ params }) => params), [
-    { offset: 0, timeout: 2, limit: 100, allowed_updates }, { offset: 14, timeout: 0, limit: 100, allowed_updates },
+    { offset: 0, timeout: 0, limit: 100, allowed_updates }, { offset: 14, timeout: 0, limit: 100, allowed_updates },
     { offset: 15, timeout: 0, limit: 100, allowed_updates },
   ]);
   assert.ok(calls.every(({ signal }) => signal instanceof AbortSignal));
@@ -74,7 +77,7 @@ test("Receive saves short fields and offsets; edits replace messages and duplica
   assert.ok(!JSON.stringify(saved).includes("raw"));
   assert.equal(saved.chats[7].messages.find((message) => message.message_id === 12).text, "[REDACTED]");
   assert.equal((await stat(path.join(dataDir, "101"))).mode & 0o777, 0o700);
-  assert.equal((await stat(path.join(dataDir, "101/store.json"))).mode & 0o777, 0o600);
+  assert.equal((await stat(path.join(dataDir, "101/store.sqlite"))).mode & 0o777, 0o600);
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
 });
 
@@ -85,7 +88,8 @@ test("A location message is shown and a new_chat_members message is filtered as 
   const joined = update(2);
   delete joined.message.text;
   joined.message.new_chat_members = [{ id: 9, first_name: "User" }];
-  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [location, joined] }));
+  const { pollOnce, call, dataDir } = await setup(t, () => ({ ok: true, result: [location, joined] }));
+  await pollOnce();
   const output = await call("read_new_messages");
   assert.match(output, /\(chat 7\) #1 /);
   assert.doesNotMatch(output, /#2 /);
@@ -96,7 +100,7 @@ test("A location message is shown and a new_chat_members message is filtered as 
 });
 
 test("Receive saves bot joins and leaves without messages", async (t) => {
-  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: [
+  const { pollOnce, call, calls, dataDir } = await setup(t, () => ({ ok: true, result: [
     { update_id: 2, my_chat_member: { chat: { id: -10, type: "group", title: "Joined", extra: "raw" },
       new_chat_member: { status: "member" } } },
     { update_id: 3, my_chat_member: { chat: { id: -20, type: "group", title: "Left" },
@@ -107,6 +111,7 @@ test("Receive saves bot joins and leaves without messages", async (t) => {
   addUpdates(state, [update(1)]);
   state.pending = [];
   await store.write(state);
+  await pollOnce();
   const output = await call("read_new_messages");
   assert.match(output, /no new messages/);
   assert.doesNotMatch(output, /\(chat -10\)|\(chat -20\)| #\d+ /);
@@ -140,24 +145,24 @@ test("Receive omits stale or unknown offsets and saves the last update time only
   const now = 2000000;
   t.mock.method(Date, "now", () => now * 1000);
   let updates = [];
-  const { call, calls, dataDir } = await setup(t, () => ({ ok: true, result: updates }));
+  const { pollOnce, call, calls, dataDir } = await setup(t, () => ({ ok: true, result: updates }));
   const store = openStore(dataDir, 101);
   for (const last_update_at of [now - 6 * 24 * 60 * 60 - 1, now - 6 * 24 * 60 * 60,
     undefined, now - 6 * 24 * 60 * 60 + 1]) {
     const state = { offset: 100, chats: {}, pending: [], ...(last_update_at === undefined ? {} : { last_update_at }) };
     await store.write(state);
     updates = [];
-    await call("read_new_messages");
+    await pollOnce();
     assert.deepEqual(calls.at(-1).params, { timeout: 0, limit: 100, allowed_updates,
       ...(last_update_at === now - 6 * 24 * 60 * 60 + 1 ? { offset: 100 } : {}) });
-    assert.deepEqual(await store.read(), state);
+    assert.deepEqual(await store.read(), { ...state, last_poll_at: now });
     updates = [update(10)];
-    await call("read_new_messages");
+    await pollOnce();
     const saved = await store.read();
     assert.equal(saved.offset, 11);
     assert.equal(saved.last_update_at, now);
     updates = [];
-    await call("read_new_messages");
+    await pollOnce();
     assert.deepEqual(calls.at(-1).params, { offset: 11, timeout: 0, limit: 100, allowed_updates });
     assert.deepEqual(await store.read(), saved);
   }
@@ -165,18 +170,19 @@ test("Receive omits stale or unknown offsets and saves the last update time only
 
 test("Receive stores 250 updates in three batches and saves each offset before the next fetch", async (t) => {
   let batch = 0;
-  const { call, calls, dataDir } = await setup(t, async () => {
+  const { pollOnce, call, calls, dataDir } = await setup(t, async () => {
     const saved = await openStore(dataDir, 101).read();
     assert.equal(saved.offset, batch === 0 ? 0 : batch * 100 + 1);
     assert.equal(saved.pending.length, batch * 100);
     const start = batch++ * 100;
     return { ok: true, result: Array.from({ length: start < 200 ? 100 : 50 }, (_, i) => update(start + i + 1)) };
   });
+  await pollOnce();
   const output = await call("read_new_messages", { timeout: 2, limit: 1000 });
   assert.match(output, /250 new messages\. offset 251\./);
   assert.doesNotMatch(output, /More updates are waiting|还有/);
-  assert.deepEqual(calls.map(({ params }) => params), [0, 101, 201].map((offset, i) =>
-    ({ offset, timeout: i === 0 ? 2 : 0, limit: 100, allowed_updates })));
+  assert.deepEqual(calls.map(({ params }) => params), [0, 101, 201].map((offset) =>
+    ({ offset, timeout: 0, limit: 100, allowed_updates })));
   const saved = await openStore(dataDir, 101).read();
   assert.equal(saved.offset, 251);
   assert.deepEqual(saved.chats[7].messages.map((message) => message.message_id),
@@ -208,21 +214,43 @@ test("Receive shows 150 pending messages in two pages with no repeats", async (t
   assert.deepEqual(ids(second), Array.from({ length: 50 }, (_, i) => i + 101));
   assert.equal(new Set([...ids(first), ...ids(second)]).size, 150);
   assert.deepEqual((await store.read()).pending, []);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 0);
 });
 
 test("Receive stops after 20 full batches and keeps messages for the next page", async (t) => {
   let id = 0;
-  const { call, calls, dataDir } = await setup(t, () => ({ ok: true,
+  const { pollOnce, call, calls, dataDir } = await setup(t, () => ({ ok: true,
     result: Array.from({ length: 100 }, () => update(++id)) }));
+  await pollOnce();
   const output = await call("read_new_messages");
   assert.match(output, /200 new messages\. offset 2001\./);
-  assert.match(output, /More updates are waiting\. Call read_new_messages again\./);
+  assert.doesNotMatch(output, /More updates are waiting/);
   assert.match(output, /还有 1800 条没显示/);
   assert.equal(calls.length, 20);
   const saved = await openStore(dataDir, 101).read();
   assert.equal(saved.chats[7].messages.length, 2000);
   assert.equal(saved.pending.length, 1800);
+});
+
+test("One poll saves SQLite pages; local reads drain them with fetch disabled", async (t) => {
+  const batches = [Array.from({ length: 100 }, (_, i) => update(i + 1)),
+    Array.from({ length: 50 }, (_, i) => update(i + 101))];
+  const { pollOnce, call, calls, dataDir } = await setup(t, () => {
+    assert.ok(batches.length, "Local reads must not call getUpdates");
+    return { ok: true, result: batches.shift() };
+  });
+  await pollOnce();
+  const file = path.join(dataDir, "101/store.sqlite");
+  assert.equal((await readFile(file)).subarray(0, 16).toString(), "SQLite format 3\0");
+  const ids = (text) => [...text.matchAll(/\) #(\d+) /g)].map((match) => Number(match[1]));
+  const pages = [];
+  for (let page = 0; page < 3; page++) {
+    pages.push(...ids(await call("read_new_messages", { limit: 60, timeout: 50 })));
+  }
+  assert.deepEqual(pages, Array.from({ length: 150 }, (_, i) => i + 1));
+  assert.deepEqual((await openStore(dataDir, 101).read()).pending, []);
+  assert.match(await call("read_new_messages", { timeout: 50 }), /no new messages/);
+  assert.equal(calls.filter(({ method }) => method === "getUpdates").length, 2);
 });
 
 test("Pending edits keep their place; owner messages stay out and deleted messages are skipped", async (t) => {
@@ -300,7 +328,7 @@ test("Pending pages put private chats, mentions, and replies first in each mode"
   }
 });
 
-test("Chat history removes shown messages from pending without repeats", async (t) => {
+test("Chat history leaves summary progress unchanged", async (t) => {
   const { call, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
   const store = openStore(dataDir, 101);
   for (const args of [{ limit: 2 }, { message_id: 3, context: 0 }]) {
@@ -312,9 +340,9 @@ test("Chat history removes shown messages from pending without repeats", async (
     const history = await call("get_chat_messages", { chat_id: 7, ...args });
     const ids = [...history.matchAll(/ #(\d+) /g)].map((match) => Number(match[1]));
     assert.deepEqual(ids, args.message_id ? [1, 3] : [2, 3]);
-    assert.deepEqual((await store.read()).pending, [["7", args.message_id ? 2 : 1], ["8", 1]]);
+    assert.deepEqual(await store.read(), state);
     const next = await call("read_new_messages");
-    for (const id of ids) assert.ok(!next.includes(`(chat 7) #${id} `));
+    for (const id of ids) assert.ok(next.includes(`(chat 7) #${id} `));
     assert.match(next, /\(chat 8\) #1 /);
   }
 });
@@ -338,7 +366,7 @@ test("Local tools list seen chats and select recent messages without fetch", asy
 
 test("Message filters return compact text, need confirmation, and do not leak tokens", async (t) => {
   let batch = 0;
-  const { call, dataDir } = await setup(t, () => ({ ok: true, result: [
+  const { pollOnce, call, dataDir } = await setup(t, () => ({ ok: true, result: [
     { update_id: ++batch, message: { message_id: batch, date: 1791684300,
       chat: { id: 7, type: "private", first_name: "Alice" }, from: { id: 9, first_name: "Alice" },
       text: `hello ${env.TELEGRAM_BOT_TOKEN}` } },
@@ -370,6 +398,7 @@ test("Message filters return compact text, need confirmation, and do not leak to
   assert.equal(invalid.isError, true);
   assert.deepEqual(JSON.parse(await readFile(file, "utf8")).exclude_regex, []);
 
+  await pollOnce();
   const output = await call("read_new_messages");
   assert.match(output, /\[private\] Alice \(chat 7\) #1 2026-10-11 02:05Z Alice: hello \[REDACTED\]/);
   assert.match(output, /\[group\] Ops \(chat -1001\) #2 2026-10-11 02:30Z group content/);
@@ -389,6 +418,7 @@ test("Message filters return compact text, need confirmation, and do not leak to
   assert.match(shown, /订单 hidden content/);
   assert.doesNotMatch(shown, /已收起 \d/);
   assert.match(await call("get_chat_messages", { chat_id: -1001 }), /group content/);
+  await pollOnce();
   const all = await call("read_new_messages", { mode: "all" });
   assert.match(all, /group content/);
   assert.match(all, /订单 hidden content/);
@@ -464,13 +494,17 @@ test("Webhook deletion needs confirmation; webhook info redacts all configured t
   });
 });
 
-test("409 errors are redacted and point to webhook tools; the lock is released", async (t) => {
-  const { call, dataDir } = await setup(t, () => ({ ok: false, error_code: 409,
+test("Poll errors give webhook guidance and release the lock", async (t) => {
+  const logs = [];
+  t.mock.method(console, "error", (message) => logs.push(message));
+  const { pollOnce, call, dataDir } = await setup(t, () => ({ ok: false, error_code: 409,
     description: `Conflict ${Object.values(env).join(" ")}` }));
-  const result = await call("read_new_messages");
-  assert.equal(result.isError, true);
-  assert.match(result.content[0].text, /409 Conflict.*get_webhook_info.*delete_webhook with confirm=true/);
-  assert.match(result.content[0].text, /Telegram API getUpdates failed: 409 Conflict \[REDACTED\]/);
+  const [result] = await pollOnce();
+  assert.match(result.error, /409 Conflict.*get_webhook_info.*delete_webhook with confirm=true/);
+  assert.match(result.error, /Telegram API getUpdates failed: 409 Conflict \[REDACTED\]/);
+  assert.equal(logs.length, 1);
+  for (const token of Object.values(env)) assert.ok(!logs[0].includes(token));
+  assert.match(await call("read_new_messages"), /no new messages/);
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
   assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
 });

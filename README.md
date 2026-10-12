@@ -59,9 +59,28 @@ It can tell you which steps you still need to complete.
 ## Read messages
 
 Ask the AI: “Read my new Telegram messages.”
-The plugin checks for new messages when you ask.
-It does not check in the background.
-Each call saves new messages and shows up to 200 messages by default.
+插件运行时，会自动在后台获取新消息。
+默认每 60 秒检查一次。
+Background fetch starts when the plugin starts.
+Ask the AI to show saved new messages when you need them.
+Each read shows up to 200 messages by default.
+It shows only messages that have not yet been summarized here.
+It never marks messages as read on Telegram.
+Reading chat history does not change this progress.
+
+在插件 Configure 中，可以关闭自动获取。
+Set **Background fetch** to `off` and restart the plugin.
+关闭后，插件不会自动从 Telegram 获取新消息。
+`read_new_messages` 只显示已经保存、但还没有总结的消息。
+要再次获取 Telegram 新消息，请重新打开后台获取。
+Clear the setting or set it to `on`, then restart the plugin.
+To change the wait, set **Fetch interval in seconds** to 30–600.
+Leave it blank to use 60 seconds.
+Restart the plugin after a change.
+
+消息会自动保存在本机的 SQLite 数据库中。
+不需要另外安装数据库。
+旧消息会自动迁移。
 If the result says 「还有 N 条没显示」, ask the AI to show the next page.
 The result also shows how many messages remain in each chat.
 You can ask for messages from one group instead.
@@ -111,7 +130,7 @@ Ask the AI: “Read my new messages. Give me a daily summary and a to-do list.�
 3. Let the AI read important groups in batches.
 4. Let the AI write the summary and the to-do list.
 
-Let the AI fetch new messages at least once every 24 hours.
+Keep the plugin running with background fetch on.
 Telegram drops updates older than 24 hours.
 
 ## Choose which messages to see
@@ -196,7 +215,7 @@ Connect the bot through Telegram Business to let it reply as you in the chats yo
 It can delete only messages sent less than 48 hours ago.
 
 Telegram keeps pending updates for no more than 24 hours.
-Let the AI fetch new messages at least once every 24 hours to avoid losing them.
+Keep the plugin running with background fetch on to avoid losing them.
 The plugin keeps the last 2000 saved messages from each chat.
 
 Telegram limits which group messages a bot can receive by default.
@@ -230,7 +249,7 @@ If a send succeeds but saving the message fails, do not send it again.
 
 The following reference is for setup, tools, and maintenance.
 
-Version 1.1.0 uses the Telegram Bot API through an MCP server in Cursor.
+Version 1.2.0 uses the Telegram Bot API through an MCP server in Cursor.
 It receives, sends, edits, deletes, and forwards messages.
 It sends and downloads files.
 It reads chat details and administrators.
@@ -293,13 +312,13 @@ Do not paste a token into chat.
 The server removes tokens from errors and error logs.
 The tools do not return tokens.
 
-### Tools in 1.1.0
+### Tools in 1.2.0
 
 | Tool | Use |
 | --- | --- |
 | `list_bots` | List bots, settings, API status, missing setup steps, and the next step. |
 | `get_me` | Get bot settings and refresh known business connections. Return missing setup steps and the next step. |
-| `read_new_messages` | Read and save new messages. Show all readable messages in full by default. Set `mode="for_me"` for group summaries. Omit `mode` to use the saved default. Set `timeout` to 0–50 seconds for the first fetch. Set `limit` to 1–1000 messages per page (default 200). |
+| `read_new_messages` | Show saved messages that have not yet been summarized. Show all readable messages in full by default. Set `mode="for_me"` for group summaries. Omit `mode` to use the saved default. The `timeout` field is kept but does not wait for Telegram. Set `limit` to 1–1000 messages per page (default 200). |
 | `list_chats` | List saved chats, with the newest chat first. |
 | `get_chat_messages` | Read saved messages for one chat as compact text. Use `limit` and `before_message_id`, or `message_id` and `context` for nearby messages and the original reply message. Set `show_filtered=true` to show filtered messages. |
 | `get_filters` | Read the bot's message filter config for the AI. Explain rules to the owner in everyday language. |
@@ -322,47 +341,49 @@ The tools do not return tokens.
 
 ### Receive messages
 
-The request timeout for most API calls and file downloads is 15 seconds.
-For `read_new_messages`, the first request timeout is `timeout + 10` seconds.
-The `timeout` parameter is an integer from 0 to 50 seconds.
-It defaults to 0. Later requests use `timeout=0` and a 10-second request timeout.
-Each `getUpdates` call requests at most 100 updates.
-The tool repeats the request until a batch has fewer than 100 updates, with at most 20 requests per tool call.
-After each batch, it adds the updates and writes the store before the next request.
-Each request uses the saved offset from the previous batch.
-If the last batch at the cap is full, the result says “More updates are waiting. Call read_new_messages again.”
+Only the background poller calls `getUpdates`.
+It starts with the plugin process and checks each configured bot.
+It uses `timeout=0` and a 10-second request timeout.
+Each call requests at most 100 updates.
+Each cycle makes at most 20 calls per bot.
+It saves each batch before the next request.
+It uses the same API and proxy fallback as the tools.
+It skips a bot if its last poll is still running or the store is locked.
+The next cycle fetches any remaining updates.
+Errors go to stderr with bot tokens removed.
+A failed poll does not stop the process.
+The timer stops when the server closes.
+Most other API calls and file downloads use a 15-second request timeout.
 
-Call `read_new_messages` to receive messages.
-It runs `getUpdates` only when you call it.
-The server does not poll in the background.
-It stores messages, edited messages, channel posts, and edited channel posts.
-It also stores business connections and business messages.
+`read_new_messages` reads only local messages that have not yet been summarized.
+Its `timeout` field remains an integer from 0 to 50 for compatibility.
+The field does not wait for Telegram.
+This stays true when background fetch is off.
+The poller stores messages, edits, channel posts, and business updates.
 Business deletion updates remove saved messages.
-It acknowledges other update types and does not store them.
-If the result says that more updates are waiting, call it again.
 Call `list_chats` to find saved chats.
 Call `get_chat_messages` to read messages for one chat.
 Message lines show the sender name (first name and last name).
 If the sender has a username, the line adds it in parentheses, such as `婷婷 (@Ting10086)`.
 Without a name, the line shows `@username` or the user ID.
 
-`read_new_messages` shows the next page from the saved queue.
+`read_new_messages` shows the next page of local unsummarized messages.
 Set `limit` to an integer from 1 to 1000. The default is 200.
 The header counts messages in this page. Current modes and filters apply to the page.
-The tool removes only the page entries from the queue and saves the store.
-A call with no new updates still shows the next saved page.
+The tool marks only the page entries as summarized in SQLite.
+A call shows the next saved page without fetching updates.
 Deleted messages and messages no longer in storage are skipped.
 If entries remain, the result says 「还有 N 条没显示。再次调用 read_new_messages 显示下一批，或用 get_chat_messages 查看某个群。」.
 The next lines give the remaining count for each chat, such as `- 销售群 (chat -1002): 还有 120 条`.
 
 For a daily summary:
 
-1. Call `read_new_messages` until 「还有 N 条没显示」 is gone. Also repeat if more updates are waiting. If you stop early, note the remaining counts for each group.
+1. Call `read_new_messages` until 「还有 N 条没显示」 is gone. If you stop early, note the remaining counts for each group.
 2. Check the message count for each group.
 3. Read important groups in batches with `get_chat_messages`. Use `limit` and `before_message_id` to read earlier batches.
 4. Write the summary and the to-do list.
 
-Let the AI fetch new messages at least once every 24 hours. Telegram drops older updates.
+Keep background fetch on. Telegram drops updates older than 24 hours.
 
 Set `message_id` on `get_chat_messages` to read the context of one saved message.
 Set `context` to an integer from 0 to 50. It defaults to 5 messages on each side.
@@ -550,7 +571,7 @@ See [Telegram bots](https://core.telegram.org/bots).
 Use `send_photo` for photos.
 Use `send_document` for other files.
 Set `file` to an existing local file path, an HTTP(S) URL, or a Telegram `file_id`.
-Use a file ID from the bot's `store.json`.
+Use a file ID from the saved message shown by the tools.
 Use the same bot that received the file ID.
 The server uploads local files with their file names.
 It passes URLs and file IDs to Telegram.
@@ -665,7 +686,7 @@ After deletion, the bot can use `getUpdates`.
 Telegram keeps incoming updates until the bot receives them.
 It keeps them for no more than 24 hours.
 See [Getting updates](https://core.telegram.org/bots/api#getting-updates).
-If you do not call `read_new_messages` within 24 hours, you lose those messages.
+If the plugin is stopped or background fetch is off for 24 hours, older updates can be lost.
 
 ### Group messages and privacy mode
 
@@ -687,24 +708,59 @@ See the official [Privacy Mode page](https://core.telegram.org/bots/features#pri
 
 ### Local storage
 
+The plugin uses `sql.js` with its bundled WASM file.
+The startup script installs the dependency when it is missing.
+Users do not compile native code or install SQLite.
+Each bot uses `~/.telegram-bot-cursor-plugin/<bot ID>/store.sqlite`.
+The bot directory uses mode `0700`. The database uses mode `0600`.
+Filter config stays in `filters.json` with mode `0600`.
+
+The tables are `meta`, `chats`, and `messages`.
+Queries do not use JOINs.
+`meta` saves `offset`, `business`, `last_update_at`, and `last_poll_at`.
+`messages.summarized_at IS NULL` means the message has not yet been summarized.
+A local page read sets `summarized_at` to the current Unix time.
+Owner business messages and tool send results start as summarized.
+`pending_order` preserves page order across chats.
+An edit keeps its place if the message is still unsummarized.
+An edit to a summarized incoming message makes it available again.
+`get_chat_messages` reads context without changing these fields.
 `my_chat_member` updates save bot joins and leaves without adding messages.
-The server saves messages in `~/.telegram-bot-cursor-plugin/<bot ID>/store.json`.
-It saves message filter config in the same bot directory as `filters.json`.
-It creates the bot directory with mode `0700` and both files with mode `0600`.
-It keeps the last 2000 messages per chat.
-It saves filtered messages too.
-It stores short fields only.
+
+The store keeps the last 2000 messages per chat and any older unsummarized messages.
+It saves filtered messages too. It stores short fields only.
 It does not store a token.
-It saves the offset and the pending display queue in the same file as the messages.
-`pending` is an array of `[chat key, message_id]` entries in arrival order.
-Incoming messages enter the queue when they are added to storage.
-An edit updates a pending message without adding a second entry.
-Owner messages and tool send results do not enter the queue.
-Existing stores start with an empty queue.
-It saves the fetch time as `last_update_at` in Unix seconds and omits the offset after 6 days because Telegram can hold updates for 24 hours.
-`poll.lock` prevents two processes from polling one bot at the same time.
+The poller omits a stale or unknown offset after 6 idle days.
+`last_update_at` changes only after a nonempty batch.
+`last_poll_at` records each successful fetch.
+`poll.lock` serializes polls and local store changes.
+A database save uses a temporary file and then renames it.
 To clear saved data, delete the bot directory.
-If a crash leaves a stale `poll.lock`, delete it when no other process reads messages for that bot.
+If a crash leaves `poll.lock`, delete it when no process uses that bot.
+
+On first open, an empty or missing database imports `store.json`.
+The import includes chats, messages, pending entries, offset, and business state.
+The old file becomes `store.json.migrated`.
+If import fails, the plugin logs the error and uses empty SQLite.
+The old file is archived. The plugin stops writing live message data to JSON.
+
+### Background fetch settings
+
+Configure exposes these settings through `mcp.json` and the plugin variables.
+Environment settings also work when you run the server directly.
+Restart the plugin after a change.
+
+| Variable | Meaning |
+| --- | --- |
+| `TELEGRAM_POLL_ENABLED` | Default: on. Empty, `1`, `true`, and `yes` mean on. `0`, `false`, `no`, and `off` mean off. Letter case does not matter. |
+| `TELEGRAM_POLL_INTERVAL_SEC` | Default: 60 seconds. Values are limited to 30–600 seconds. Empty or invalid values use 60. |
+
+When fetch is off, the plugin does not auto-fetch Telegram messages.
+`read_new_messages` only shows local unsummarized messages.
+Turn fetch back on to get new Telegram messages again.
+Tests use `createServer({ pollEnabled: false })` to disable the timer.
+They use `server.pollOnce(botId)` to fetch one cycle.
+Omit `botId` to test all configured bots.
 
 ### Telegram Business
 

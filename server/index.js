@@ -8,12 +8,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { businessStatus, loadBots, selectBot } from "./bots.js";
 import { callApi, downloadFile, errorMessage, redact } from "./telegram.js";
-import { addBusinessConnection, addMessage, addUpdates, chatKey, openStore } from "./store.js";
+import { addBusinessConnection, addMessage, chatKey, openStore } from "./store.js";
+import { startPoller } from "./poll.js";
 import { classify, describeFilterChanges, filterFields, formatMessage, formatMessages,
   ownerNamesHint, previewFilterImpact, readFilters, writeFilters } from "./filter.js";
 
 const botSchema = z.string().optional().describe("Bot username (with or without @) or numeric bot ID from list_bots. Omit for the default bot (TELEGRAM_BOT_TOKEN).");
-const UPDATE_CALL_LIMIT = 20;
 const RATE_REMINDER = "Reminder: Telegram limits: in one chat, avoid more than 1 message per second; in one group, no more than 20 messages per minute; for bulk notifications, about 30 messages per second at most. Over the limit, Telegram returns 429 with retry_after. Bots that share one token share these limits.";
 
 function textResult(obj, tokens = []) {
@@ -28,8 +28,8 @@ function errorResult(error, tokens) {
   return { content: [{ type: "text", text: `Error: ${errorMessage(error, tokens)}` }], isError: true };
 }
 
-export function createServer({ env = process.env, fetch, dataDir } = {}) {
-  const server = new McpServer({ name: "telegram-bot", version: "1.1.0" });
+export function createServer({ env = process.env, fetch, dataDir, pollEnabled } = {}) {
+  const server = new McpServer({ name: "telegram-bot", version: "1.2.0" });
   const bots = loadBots(env);
   const tokens = bots.map((entry) => entry.token);
   const usernames = new Map();
@@ -253,47 +253,16 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       return errorResult(error, tokens);
     }
   });
-  server.tool("read_new_messages", "Fetch and save new updates in batches of 100, up to 20 calls. Show the next page of saved incoming messages. Set limit from 1 to 1000 (default 200). Only the first fetch uses timeout. Call again while updates or saved messages are waiting. Omit mode to use the saved default_mode (initially all). Mode all shows every readable incoming message in full. Mode for_me shows private chats, bot and owner @mentions and replies, allowed chats, allowed users, and include matches in full. Other group messages show one summary line per group. Both modes apply local filters and the 500-character cut. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept unless an exclude_rules item has include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only. Never mark messages as read. Telegram keeps updates for 24 hours only.", {
+  server.tool("read_new_messages", "The background fetcher saves new Telegram messages. Show one page of local incoming messages that are not yet summarized. This tool never fetches Telegram updates. It never marks messages as read on Telegram. Set limit from 1 to 1000. The default is 200. The timeout field is kept for compatibility. It does not wait for Telegram. Call again while local messages are waiting. Omit mode to use the saved default. The initial mode is all. Mode all shows every readable incoming message in full. Mode for_me shows private messages, @mentions, and replies in full. Mentions and replies to the bot or owner count. Allowed chats, allowed users, and include matches also show in full. Other group messages show one count line per group. Both modes apply local filters. Text is cut at 500 characters. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept by default. An exclude_rules item can hide them with include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only.", {
     bot: botSchema, timeout: z.number().int().min(0).max(50).default(0),
     limit: z.number().int().min(1).max(1000).default(200),
     mode: z.enum(["all", "for_me"]).optional(),
-  }, async ({ bot, timeout, limit, mode }) => {
+  }, async ({ bot, limit, mode }) => {
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
       return await store.withLock(async () => {
         const state = await store.read();
-        await getUsername(entry);
-        const resetOffset = state.last_update_at === undefined ? state.offset > 0
-          : Math.floor(Date.now() / 1000) - state.last_update_at >= 6 * 24 * 60 * 60;
-        let more = false;
-        const checkedConnections = new Set();
-        for (let batch = 0; batch < UPDATE_CALL_LIMIT; batch++) {
-          const wait = batch === 0 ? timeout : 0;
-          const updates = await callApi(entry.token, "getUpdates", {
-            ...(batch === 0 && resetOffset ? {} : { offset: state.offset }), timeout: wait, limit: 100,
-            allowed_updates: ["message", "edited_message", "channel_post", "edited_channel_post",
-              "my_chat_member", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"],
-          }, { fetch, env, timeoutMs: (wait + 10) * 1000 });
-          const connectionIds = new Set(updates.map((update) => (update.business_message
-            ?? update.edited_business_message ?? update.deleted_business_messages)?.business_connection_id).filter(Boolean));
-          for (const business_connection_id of connectionIds) {
-            if (state.business?.[business_connection_id]?.user_id !== undefined || checkedConnections.has(business_connection_id)) continue;
-            checkedConnections.add(business_connection_id);
-            let connection;
-            try {
-              connection = updates.find((update) => update.business_connection?.id === business_connection_id)?.business_connection
-                ?? await callApi(entry.token, "getBusinessConnection", { business_connection_id }, { fetch, env });
-            } catch (error) {
-              return errorResult(error, tokens);
-            }
-            addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
-          }
-          addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
-          await store.write(state);
-          more = updates.length === 100;
-          if (!more) break;
-        }
         state.pending = state.pending.filter(([key, id]) =>
           state.chats[key]?.messages.some((message) => message.message_id === id));
         const me = await filterMe(entry, state);
@@ -308,19 +277,16 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
         const shown = new Set(messages.map((message) => `${chatKey(message.chat_id, message.business_connection_id)}:${message.message_id}`));
         state.pending = state.pending.filter(([key, id]) => !shown.has(`${key}:${id}`));
         const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
-          offset: state.offset, more, mode, pending: state.pending }), tokens);
+          offset: state.offset, mode, pending: state.pending }), tokens);
         await store.write(state);
         return result;
       });
     } catch (error) {
-      if (error.code === 409) {
-        error = new Error(`Telegram returned 409 Conflict. A webhook is set for this bot, or another process polls this bot. Call get_webhook_info to check. Call delete_webhook with confirm=true to remove the webhook. ${errorMessage(error, tokens)}`);
-      }
       return errorResult(error, tokens);
     }
   });
 
-  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
+  server.tool("get_chat_messages", "Read saved messages for one chat as compact text, oldest first. This does not change new message progress. Set message_id to show its saved original reply message first, then context messages before and after it. Context defaults to 5 on each side (0-50). The target starts with →. Ignore limit and before_message_id when message_id is set. Hide filtered messages by default. Set show_filtered=true to view them.", {
     bot: botSchema, chat_id: z.union([z.string(), z.number()]),
     limit: z.number().int().min(1).max(200).default(20), before_message_id: z.number().int().optional(),
     message_id: z.number().int().optional(), context: z.number().int().min(0).max(50).default(5),
@@ -358,9 +324,6 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
         if (!lines.length) lines.push("No saved messages.");
         const hidden = messages.length - visible.length;
         if (hidden) lines.push(`已收起 ${hidden} 条。Set show_filtered=true to view them.`);
-        const shown = new Set(visible.map(({ message }) => message.message_id));
-        state.pending = state.pending.filter(([key, id]) => key !== String(chat_id) || !shown.has(id));
-        await store.write(state);
         return plainTextResult(lines.join("\n"), tokens);
       });
     } catch (error) {
@@ -449,6 +412,7 @@ export function createServer({ env = process.env, fetch, dataDir } = {}) {
       return errorResult(error, tokens);
     }
   });
+  startPoller(server, bots, { pollEnabled, env, fetch, dataDir, tokens });
   return server;
 }
 

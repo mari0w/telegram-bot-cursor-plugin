@@ -1,33 +1,142 @@
-import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import initSqlJs from "sql.js";
 
+const require = createRequire(import.meta.url);
+const sqlite = initSqlJs({ locateFile: () => require.resolve("sql.js/dist/sql-wasm.wasm") });
+const initializing = new Map();
 const CHAT_MESSAGE_LIMIT = 2000;
 const pick = (obj, fields) => Object.fromEntries(fields.filter((key) => obj[key] !== undefined)
   .map((key) => [key, obj[key]]));
+const messageKey = (chat, id) => JSON.stringify([chat, id]);
+
+function rows(db, sql) {
+  const result = db.exec(sql)[0];
+  return result ? result.values.map((values) => Object.fromEntries(result.columns.map((key, i) => [key, values[i]]))) : [];
+}
+
+function saveState(db, state) {
+  const previous = new Map(rows(db, "SELECT chat_key, message_id, summarized_at FROM messages")
+    .map((row) => [messageKey(row.chat_key, row.message_id), row.summarized_at]));
+  const pending = new Map((state.pending ?? []).map(([chat, id], i) => [messageKey(String(chat), id), i]));
+  const now = Math.floor(Date.now() / 1000);
+  db.run("BEGIN");
+  try {
+    db.run("DELETE FROM meta; DELETE FROM chats; DELETE FROM messages;");
+    for (const key of ["offset", "business", "last_update_at", "last_poll_at"]) {
+      if (state[key] !== undefined) db.run("INSERT INTO meta VALUES (?, ?)", [key, JSON.stringify(state[key])]);
+    }
+    const insertChat = db.prepare("INSERT INTO chats VALUES (?, ?, ?, ?)");
+    const insertMessage = db.prepare("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?)");
+    try {
+      for (const [key, entry] of Object.entries(state.chats ?? {})) {
+        insertChat.run([key, JSON.stringify(entry.chat), entry.left ? 1 : 0, entry.business_connection_id ?? null]);
+        for (const message of entry.messages) {
+          const id = messageKey(key, message.message_id);
+          const order = message.outgoing ? undefined : pending.get(id);
+          const summarized = order === undefined ? previous.get(id) ?? now : null;
+          insertMessage.run([key, message.message_id, message.update_id ?? null, JSON.stringify(message), summarized, order ?? null]);
+        }
+      }
+    } finally {
+      insertChat.free();
+      insertMessage.free();
+    }
+    db.run("COMMIT");
+  } catch (error) {
+    db.run("ROLLBACK");
+    throw error;
+  }
+}
 
 export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-cursor-plugin"), botId) {
   const dir = path.join(dataDir, String(botId));
-  const file = path.join(dir, "store.json");
+  const file = path.join(dir, "store.sqlite");
+  const legacy = path.join(dir, "store.json");
   const lock = path.join(dir, "poll.lock");
-  const makeDir = () => mkdir(dir, { recursive: true, mode: 0o700 });
+  const makeDir = async () => {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await chmod(dir, 0o700);
+  };
+  const persist = async (db) => {
+    const temp = path.join(dir, "store.sqlite.tmp");
+    await writeFile(temp, db.export(), { mode: 0o600 });
+    await chmod(temp, 0o600);
+    await rename(temp, file);
+  };
+  const load = async () => {
+    const SQL = await sqlite;
+    let bytes;
+    try { bytes = await readFile(file); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    const db = new SQL.Database(bytes);
+    db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS chats (chat_key TEXT PRIMARY KEY, chat_json TEXT NOT NULL,
+        left INTEGER, business_connection_id TEXT);
+      CREATE TABLE IF NOT EXISTS messages (chat_key TEXT NOT NULL, message_id INTEGER NOT NULL,
+        update_id INTEGER, payload TEXT NOT NULL, summarized_at INTEGER, pending_order INTEGER,
+        PRIMARY KEY (chat_key, message_id));`);
+    return { db, missing: !bytes?.length };
+  };
+  const initialize = async () => {
+    await makeDir();
+    const { db, missing } = await load();
+    try {
+      if (!rows(db, "SELECT key FROM meta LIMIT 1").length
+        && !rows(db, "SELECT chat_key FROM chats LIMIT 1").length
+        && !rows(db, "SELECT message_id FROM messages LIMIT 1").length) {
+        try {
+          const source = await readFile(legacy, "utf8");
+          saveState(db, JSON.parse(source));
+          await persist(db);
+          await rename(legacy, `${legacy}.migrated`);
+        } catch (error) {
+          if (error.code !== "ENOENT") {
+            console.error("Could not import the old message store. The plugin will use empty SQLite.");
+            db.run("DELETE FROM meta; DELETE FROM chats; DELETE FROM messages;");
+            await persist(db);
+            // Archive a failed import too. Do not retry it on each read.
+            await rename(legacy, `${legacy}.migrated`).catch(() => {});
+          }
+        }
+      }
+      if (missing) await persist(db);
+    } finally { db.close(); }
+  };
+  const ready = async () => {
+    if (!initializing.has(file)) initializing.set(file, initialize().finally(() => initializing.delete(file)));
+    await initializing.get(file);
+  };
   return {
     dir,
     async read() {
+      await ready();
+      const { db } = await load();
       try {
-        const state = JSON.parse(await readFile(file, "utf8"));
-        state.pending ??= [];
+        const state = { offset: 0, chats: {}, pending: [] };
+        for (const { key, value } of rows(db, "SELECT key, value FROM meta")) state[key] = JSON.parse(value);
+        for (const row of rows(db, "SELECT * FROM chats ORDER BY rowid")) {
+          state.chats[row.chat_key] = { chat: JSON.parse(row.chat_json), messages: [],
+            ...(row.left ? { left: true } : {}),
+            ...(row.business_connection_id ? { business_connection_id: row.business_connection_id } : {}) };
+        }
+        for (const row of rows(db, "SELECT chat_key, payload FROM messages ORDER BY rowid")) {
+          state.chats[row.chat_key].messages.push(JSON.parse(row.payload));
+        }
+        state.pending = rows(db, "SELECT chat_key, message_id FROM messages WHERE summarized_at IS NULL ORDER BY pending_order")
+          .map((row) => [row.chat_key, row.message_id]);
         return state;
-      } catch (error) {
-        if (error.code === "ENOENT") return { offset: 0, chats: {}, pending: [] };
-        throw error;
-      }
+      } finally { db.close(); }
     },
-    async write(store) {
-      await makeDir();
-      const temp = path.join(dir, "store.json.tmp");
-      await writeFile(temp, JSON.stringify(store), { mode: 0o600 });
-      await rename(temp, file);
+    async write(state) {
+      await ready();
+      const { db } = await load();
+      try {
+        saveState(db, state);
+        await persist(db);
+      } finally { db.close(); }
     },
     async withLock(fn) {
       await makeDir();
@@ -36,7 +145,9 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
         handle = await open(lock, "wx", 0o600);
       } catch (error) {
         if (error.code === "EEXIST") {
-          throw new Error(`Another process is reading messages for this bot. Try again later. If no other process runs, delete ${lock}.`);
+          const busy = new Error(`Another process is reading messages for this bot. Try again later. If no other process runs, delete ${lock}.`);
+          busy.code = "STORE_BUSY";
+          throw busy;
         }
         throw error;
       }

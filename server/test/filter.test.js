@@ -95,14 +95,14 @@ const connection = { id: "conn", user: { id: 1, username: "owner" }, user_chat_i
 
 async function setup(t, reply) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-filter-"));
-  const server = createServer({ env, dataDir, fetch: async (url, options) => Response.json({ ok: true,
+  const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url, options) => Response.json({ ok: true,
     result: reply(url.split("/").at(-1), JSON.parse(options.body)) }) });
-  const client = new Client({ name: "filter-test", version: "1.1.0" });
+  const client = new Client({ name: "filter-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
-  return { store: openStore(dataDir, 101), call: async (name, args = {}) => {
+  return { pollOnce: () => server.pollOnce("101"), store: openStore(dataDir, 101), call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     for (const token of Object.values(env)) assert.ok(!JSON.stringify(result).includes(token));
     return result;
@@ -169,12 +169,13 @@ test("Known business owners are protected in new messages, saved history, and pr
     message_id: i + 1, date: 1, chat: group, from: message.from, text,
     ...(i === 1 ? { reply_to_message: { message_id: 1, from: { id: 1 } } } : {}),
   } }));
-  const { call, store } = await setup(t, (method) => method === "getMe" ? me : updates);
+  const { pollOnce, call, store } = await setup(t, (method) => method === "getMe" ? me : updates);
   const state = { offset: 0, chats: {} };
   addBusinessConnection(state, connection);
   assert.equal(state.business.conn.user_username, "owner");
   await store.write(state);
   await call("set_filters", { exclude_keywords: ["订单"], confirm: true });
+  await pollOnce();
   const fresh = (await call("read_new_messages")).content[0].text;
   assert.match(fresh, /@OWNER 订单/);
   assert.match(fresh, /订单 reply/);
@@ -191,13 +192,14 @@ test("An owner without a username is not matched by a first name mention in a gr
   const updates = [{ update_id: 1, message: {
     message_id: 1, date: 1, chat: group, from: message.from, text: "@Alice 订单",
   } }];
-  const { call, store } = await setup(t, (method) => method === "getMe" ? me : updates);
+  const { pollOnce, call, store } = await setup(t, (method) => method === "getMe" ? me : updates);
   const state = { offset: 0, chats: {} };
   addBusinessConnection(state, { ...connection, user: { id: 1, first_name: "Alice" } });
   assert.equal(state.business.conn.user_name, "Alice");
   assert.equal(state.business.conn.user_username, undefined);
   await store.write(state);
   await call("set_filters", { exclude_keywords: ["订单"], confirm: true });
+  await pollOnce();
   const fresh = (await call("read_new_messages")).content[0].text;
   assert.doesNotMatch(fresh, /@Alice/);
   assert.match(fresh, /已收起 1 条/);
@@ -263,13 +265,16 @@ test("For-me mentions use owner names and Business replies use the owner ID", ()
 
 test("Owner names need confirmation; empty names add hints for each for-me read and mode preview", async (t) => {
   let id = 0;
-  const { call, store } = await setup(t, (method) => method === "getMe" ? me : [
+  const { pollOnce, call, store } = await setup(t, (method) => method === "getMe" ? me : [
     { update_id: ++id, business_connection: connection },
     { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "@enoch 看一下" } },
     { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "回复你",
       reply_to_message: { message_id: 1, from: { id: 1 } } } },
   ]);
-  const read = async (args) => (await call("read_new_messages", args)).content[0].text;
+  const read = async (args) => {
+    await pollOnce();
+    return (await call("read_new_messages", args)).content[0].text;
+  };
   const hint = "AI: owner_names is empty. Ask the owner in plain words for their Telegram username. "
     + "Suggested value: @owner. Ask the owner to confirm it, then save it with set_filters (preview first).";
   const preview = (await call("set_filters", { owner_names: ["enoch"] })).content[0].text;
@@ -358,12 +363,15 @@ test("Format compact lines, summaries, and filtered counts", () => {
 test("Read modes keep muted summaries and change the saved default only after confirmation", async (t) => {
   const muted = { id: -1002, type: "group", title: "Muted" };
   let id = 0;
-  const { call, store } = await setup(t, (method) => method === "getMe" ? me : [
+  const { pollOnce, call, store } = await setup(t, (method) => method === "getMe" ? me : [
     { update_id: ++id, message: { message_id: id, date: id, chat: group, text: "plain group message" } },
     { update_id: ++id, message: { message_id: id, date: id, chat: muted, text: "muted message" } },
   ]);
   await call("set_filters", { mute_chats: [muted.id], confirm: true });
-  const read = async (args) => (await call("read_new_messages", args)).content[0].text;
+  const read = async (args) => {
+    await pollOnce();
+    return (await call("read_new_messages", args)).content[0].text;
+  };
   const full = await read();
   assert.match(full, /\[group\] Ops .*plain group message/);
   assert.match(full, /Group summary:\n- Muted .*1 new/);
@@ -407,7 +415,7 @@ test("Message context shows the original reply and nearby saved messages with fi
   assert.match(output, /\n→ \[group\] Ops .*#8 .*Message 8/);
   assert.match(output, /已收起 1 条/);
   assert.doesNotMatch(output, /hidden|Other chat/);
-  assert.deepEqual((await store.read()).pending, [2, 4, 14, 15].map((id) => [String(group.id), id]).concat([["7", 1]]));
+  assert.deepEqual((await store.read()).pending, Array.from({ length: 15 }, (_, i) => i + 1).map((id) => [String(group.id), id]).concat([["7", 1]]));
   assert.deepEqual(ids(await read({ context: 1 })), [1, 7, 8, 9]);
   assert.doesNotMatch(await read({ context: 7, show_filtered: true }), /原消息：/);
   assert.deepEqual(ids(await read({ show_filtered: true })), [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);

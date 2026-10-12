@@ -18,18 +18,18 @@ const message = (id, user = 9, text = "Incoming") => ({ message_id: id, date: id
 async function setup(t, reply) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-business-"));
   const calls = [];
-  const server = createServer({ env: { TELEGRAM_BOT_TOKEN: token }, dataDir, fetch: async (url, options) => {
+  const server = createServer({ pollEnabled: false, env: { TELEGRAM_BOT_TOKEN: token }, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
     const params = JSON.parse(options.body);
     calls.push({ method, params });
     return Response.json(await reply(method, params));
   } });
-  const client = new Client({ name: "business-test", version: "1.1.0" });
+  const client = new Client({ name: "business-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
-  return { calls, store: openStore(dataDir, 101), call: async (name, args = {}) => {
+  return { pollOnce: () => server.pollOnce("101"), calls, store: openStore(dataDir, 101), call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     assert.ok(!JSON.stringify(result).includes(token));
     const text = result.content[0].text;
@@ -46,8 +46,9 @@ test("Business receive separates chats, keeps owner context, and removes deleted
     { update_id: 3, business_message: message(2, 1, "Owner context") },
     { update_id: 4, message: normal },
   ];
-  const { call, store, calls } = await setup(t, (method) => ({ ok: true,
+  const { pollOnce, call, store, calls } = await setup(t, (method) => ({ ok: true,
     result: method === "getMe" ? { id: 101, username: "my_bot" } : updates }));
+  await pollOnce();
   const output = await call("read_new_messages");
   assert.match(output, /2 new messages/);
   assert.match(output, /\[business private\] Alice \(chat conn:7\).*Incoming \[REDACTED\]/);
@@ -63,19 +64,22 @@ test("Business receive separates chats, keeps owner context, and removes deleted
   const chats = await call("list_chats");
   assert.ok(chats.some((chat) => chat.id === "conn:7" && chat.chat_key === "conn:7" && chat.business_connection_id === "conn"));
   assert.ok(chats.some((chat) => chat.id === 7 && chat.chat_key === "7"));
-  assert.deepEqual(calls.map(({ method }) => method), ["getMe", "getUpdates"]);
-  assert.ok(calls[1].params.allowed_updates.includes("business_connection"));
-  assert.ok(calls[1].params.allowed_updates.includes("deleted_business_messages"));
+  assert.deepEqual(calls.map(({ method }) => method), ["getUpdates", "getMe"]);
+  assert.ok(calls[0].params.allowed_updates.includes("business_connection"));
+  assert.ok(calls[0].params.allowed_updates.includes("deleted_business_messages"));
   updates = [{ update_id: 5, business_message: {
     ...message(3), sender_business_bot: { id: 101 },
   } }];
+  await pollOnce();
   assert.match(await call("read_new_messages", { mode: "all" }), /no new messages/);
   assert.equal((await store.read()).chats["conn:7"].messages.at(-1).outgoing, true);
   updates = [{ update_id: 6, edited_business_message: { ...message(1), text: "Edited" } }];
+  await pollOnce();
   assert.match(await call("read_new_messages"), /\(edited\).*Edited/);
   updates = [{ update_id: 7, deleted_business_messages: {
     business_connection_id: "conn", chat: normal.chat, message_ids: [1],
   } }];
+  await pollOnce();
   assert.match(await call("read_new_messages"), /no new messages/);
   assert.deepEqual((await store.read()).chats["conn:7"].messages.map((item) => item.message_id), [2, 3]);
   assert.equal((await store.read()).chats[7].messages.length, 1);
@@ -118,12 +122,13 @@ test("Outgoing business echoes replace the sent message within the same chat key
 
 test("Receive looks up missing and empty connections before it stores owner messages", async (t) => {
   let updates;
-  const { call, store, calls } = await setup(t, (method) => ({ ok: true, result: method === "getMe"
+  const { pollOnce, call, store, calls } = await setup(t, (method) => ({ ok: true, result: method === "getMe"
     ? { id: 101, username: "my_bot" } : method === "getBusinessConnection" ? connection : updates }));
   for (const business of [undefined, { conn: {} }]) {
     await store.write({ offset: 0, chats: {}, pending: [], ...(business ? { business } : {}) });
     updates = [{ update_id: 1, business_message: message(1, 1, "Owner context") }];
     const before = calls.filter(({ method }) => method === "getBusinessConnection").length;
+    await pollOnce();
     assert.match(await call("read_new_messages"), /no new messages/);
     const lookups = calls.filter(({ method }) => method === "getBusinessConnection");
     assert.equal(lookups.length, before + 1);
@@ -138,7 +143,7 @@ test("Receive looks up missing and empty connections before it stores owner mess
 test("Receive looks up unknown connections and leaves the batch unchanged on lookup failure", async (t) => {
   let updates;
   let fail = false;
-  const { call, store, calls } = await setup(t, (method, params) => method === "getBusinessConnection" && fail && params.business_connection_id === "unknown"
+  const { pollOnce, call, store, calls } = await setup(t, (method, params) => method === "getBusinessConnection" && fail && params.business_connection_id === "unknown"
     ? { ok: false, error_code: 400, description: "Unknown connection" }
     : { ok: true, result: method === "getMe" ? { id: 101, username: "my_bot" }
       : method === "getBusinessConnection" ? { ...connection, id: params.business_connection_id } : updates });
@@ -150,15 +155,17 @@ test("Receive looks up unknown connections and leaves the batch unchanged on loo
     if (fail) updates.push({ update_id: 2, business_message: { ...message(2, 1), business_connection_id: "unknown" } });
     const initial = await store.read();
     const before = calls.filter(({ method }) => method === "getBusinessConnection").length;
+    const [polled] = await pollOnce();
     const output = await call("read_new_messages");
     if (fail) {
-      assert.equal(output.isError, true);
+      assert.match(polled.error, /Unknown connection/);
       assert.deepEqual(await store.read(), initial);
       assert.equal((await store.read()).offset, 0);
     } else assert.match(output, /no new messages/);
     assert.equal(calls.filter(({ method }) => method === "getBusinessConnection").length, before + (fail ? 2 : 1));
     if (fail) {
       fail = false;
+      await pollOnce();
       assert.match(await call("read_new_messages"), /no new messages/);
     }
     assert.equal((await store.read()).offset, type === "business_message" ? 3 : 2);

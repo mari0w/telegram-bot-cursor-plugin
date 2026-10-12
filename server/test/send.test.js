@@ -16,17 +16,17 @@ const message = (id, chat = 7, text = "Sent") => ({ message_id: id, date: id,
 async function setup(t, reply) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-send-"));
   const calls = [];
-  const server = createServer({ env, dataDir, fetch: async (url, options) => {
+  const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
     calls.push({ url, method, params: JSON.parse(options.body) });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
-  const client = new Client({ name: "send-test", version: "1.1.0" });
+  const client = new Client({ name: "send-test", version: "1.2.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   t.after(async () => { await client.close(); await server.close(); await rm(dataDir, { recursive: true, force: true }); });
   await server.connect(serverTransport);
   await client.connect(clientTransport);
-  return { dataDir, calls, call: async (name, args = {}) => {
+  return { dataDir, calls, pollOnce: () => server.pollOnce("101"), call: async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     for (const token of Object.values(env)) assert.ok(!JSON.stringify(result).includes(token));
     return result.isError ? result : ["read_new_messages", "get_chat_messages"].includes(name)
@@ -83,9 +83,10 @@ test("A getMe failure on the first read leaves the offset unchanged and does not
 test("Send maps reply parameters and saves both sides of the chat", async (t) => {
   const incoming = { ...message(1, 7, "Incoming"), from: { id: 9, is_bot: false, first_name: "User" } };
   const sent = message(2, 7, "<b>Hello</b>");
-  const { call, calls, dataDir } = await setup(t, (method) => ({ ok: true,
+  const { pollOnce, call, calls, dataDir } = await setup(t, (method) => ({ ok: true,
     result: method === "getMe" ? { id: 101, username: "my_bot" }
       : method === "getUpdates" ? [{ update_id: 1, message: incoming }] : sent }));
+  await pollOnce();
   await call("read_new_messages");
   const result = await call("send_message", { chat_id: 7, text: sent.text, parse_mode: "HTML",
     reply_to_message_id: 1, disable_notification: false, confirm: true });

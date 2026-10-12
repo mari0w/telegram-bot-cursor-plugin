@@ -5,30 +5,35 @@ description: Use the Telegram Bot API to manage bots, messages, files, chat deta
 
 # Telegram Bot
 
-Use the tools in version 1.1.0.
+Use the tools in version 1.2.0.
 
 1. Call `list_bots` first.
 2. Pass `bot` with a username or numeric bot ID to select a bot.
 3. Omit `bot` to use the default bot from `TELEGRAM_BOT_TOKEN`.
-4. Call `read_new_messages` to receive and save new messages.
+4. Call `read_new_messages` to show saved messages that have not yet been summarized.
 5. Call `list_chats` to find saved chats.
 6. Call `get_chat_messages` to read saved messages for one chat.
 7. Call `get_me` to check the selected bot's details when needed.
 8. Never paste a bot token into chat.
 9. Ask the user to change the token in plugin Configure only for a 401 Unauthorized error.
 
-`read_new_messages` fetches batches of 100 updates, with at most 20 requests per call.
-Only the first request uses `timeout`. Later requests use 0.
-It saves each batch before the next request.
-It shows the next page of saved incoming messages, even if no new updates arrive.
+The plugin fetches new messages in the background by default.
+It checks when the plugin starts and then every 60 seconds.
+`read_new_messages` reads only local messages that have not yet been summarized.
+It never calls `getUpdates`.
+The `timeout` field is kept but does not wait for Telegram.
 Set `limit` from 1 to 1000. The default is 200 messages per page.
 Current modes and filters apply to each page.
-If the result says that more updates are waiting, call it again.
-If it says 「还有 N 条没显示」, call it again for the next page or use the remaining counts to select a group.
-It does not poll in the background.
-Tell the user to let the AI fetch new messages at least once every 24 hours.
+If it says 「还有 N 条没显示」, call it again for the next page.
+`get_chat_messages` reads context without changing summary progress.
+Never mark messages as read on Telegram.
+When background fetch is off, the plugin does not fetch new Telegram messages.
+The read tool can only show messages already saved.
+Tell the user to turn background fetch back on to get new messages.
+SQLite storage and migration from the old JSON store are automatic.
+The local store keeps the last 2000 messages per chat and older unsummarized messages.
+Keep the plugin running with background fetch on.
 Telegram drops updates older than 24 hours.
-The local store keeps the last 2000 messages per chat.
 
 ## Setup guide
 
@@ -42,19 +47,20 @@ Call `get_me` or `list_bots` again to check before the next step.
 Turning off privacy mode is required during setup.
 Tell the owner to send `/setprivacy` to BotFather, select the bot, and tap **Disable**.
 After privacy mode is off, tell the owner to remove the bot from old groups and add it again.
-After the owner connects the bot, call `read_new_messages` once to receive the connection.
+After the owner connects the bot, wait for the next background fetch.
+Then call `read_new_messages` once.
 Then call `get_me` again to check it.
 Telegram Premium is not needed for business bots.
 Bot API 10.0 removed this requirement. See the [Bot API changelog](https://core.telegram.org/bots/api-changelog).
 
 ## Daily summary
 
-1. Call `read_new_messages` until there is no 「还有 N 条没显示」. Also repeat if more updates are waiting. If you stop early, note the remaining counts for each group.
+1. Call `read_new_messages` until there is no 「还有 N 条没显示」. If you stop early, note the remaining counts for each group.
 2. Check the message count for each group.
 3. Read important groups in batches with `get_chat_messages`. Use `limit` and `before_message_id` to read earlier batches.
 4. Write the summary and the to-do list.
 
-Remind the user to let the AI fetch new messages at least once every 24 hours.
+Remind the user to keep the plugin running with background fetch on.
 Telegram drops updates older than 24 hours.
 
 ## Telegram Business
@@ -331,7 +337,7 @@ On 409 Conflict, call `get_webhook_info` to check the webhook.
 Another process can also cause 409 if it polls the same token.
 Use the preview and agreement flow for `delete_webhook` to remove a webhook.
 Set `drop_pending_updates=true` only to discard pending updates.
-Call `read_new_messages` after removal to use `getUpdates`.
+After removal, the background fetcher can use `getUpdates` again.
 
 ## Privacy mode
 
