@@ -24,8 +24,14 @@ function plainTextResult(text, tokens = []) {
   return { content: [{ type: "text", text: redact(text, tokens) }] };
 }
 
-function errorResult(error, tokens) {
-  return { content: [{ type: "text", text: `Error: ${errorMessage(error, tokens)}` }], isError: true };
+function pollError(state) {
+  return state.last_poll_error ? { poll_error: state.last_poll_error,
+    ...(state.last_poll_error_at === undefined ? {} : { poll_error_at: state.last_poll_error_at }) } : {};
+}
+
+function errorResult(error, tokens, fields = {}) {
+  const extra = Object.keys(fields).length ? `\n${JSON.stringify(fields, null, 2)}` : "";
+  return { ...plainTextResult(`Error: ${errorMessage(error, tokens)}${extra}`, tokens), isError: true };
 }
 
 export function createServer({ env = process.env, fetch, dataDir, pollEnabled } = {}) {
@@ -36,13 +42,27 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
   const getMe = async (entry) => {
     const result = await callApi(entry.token, "getMe", {}, { fetch, env });
     usernames.set(entry.number, result.username);
+    const store = openStore(dataDir, entry.id);
+    await store.withLock(async () => {
+      const state = await store.read();
+      state.bot_username = redact(result.username ?? "", tokens);
+      await store.write(state);
+    });
     return result;
   };
-  const getUsername = async (entry) => usernames.has(entry.number)
-    ? usernames.get(entry.number) : (await getMe(entry)).username;
-  const filterMe = async (entry, state) => {
+  const getUsername = async (entry, allowMissing = false) => {
+    if (usernames.has(entry.number)) return usernames.get(entry.number);
+    try { return (await getMe(entry)).username; }
+    catch (error) {
+      const state = await openStore(dataDir, entry.id).read();
+      if (state.bot_username !== undefined) return state.bot_username;
+      if (allowMissing) return "";
+      throw error;
+    }
+  };
+  const filterMe = async (entry, state, username) => {
     const owners = Object.values(state.business ?? {});
-    return { id: entry.id, username: await getUsername(entry),
+    return { id: entry.id, username: username ?? await getUsername(entry, true),
       owner_ids: owners.map((owner) => owner.user_id).filter((id) => id !== undefined),
       owner_usernames: owners.map((owner) => owner.user_username).filter(Boolean) };
   };
@@ -212,7 +232,8 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
     try {
       const results = [];
       for (const entry of bots) {
-        const info = { number: entry.number, id: entry.id, default: entry.default };
+        const state = await openStore(dataDir, entry.id).read();
+        const info = { number: entry.number, id: entry.id, default: entry.default, ...pollError(state) };
         try {
           const me = await getMe(entry);
           const { can_connect_to_business, can_read_all_group_messages, missing_steps, next_step } =
@@ -232,10 +253,11 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
   server.tool("get_me", "Get the selected bot's details and missing setup steps. Refresh known business connections.", {
     bot: botSchema,
   }, async ({ bot }) => {
+    let store;
     try {
       const entry = await selectBot(bots, bot, getUsername);
+      store = openStore(dataDir, entry.id);
       const me = await getMe(entry);
-      const store = openStore(dataDir, entry.id);
       const status = await store.withLock(async () => {
         const state = await store.read();
         const ids = Object.keys(state.business ?? {});
@@ -244,13 +266,13 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
           addBusinessConnection(state, JSON.parse(redact(JSON.stringify(connection), tokens)));
         }
         if (ids.length) await store.write(state);
-        return businessStatus(me, state);
+        return { ...businessStatus(me, state), ...pollError(state) };
       });
       const { id, username, first_name, can_join_groups, supports_inline_queries } = me;
       return textResult({ id, username, first_name, can_join_groups, supports_inline_queries,
         ...status, number: entry.number, default: entry.default }, tokens);
     } catch (error) {
-      return errorResult(error, tokens);
+      return errorResult(error, tokens, store ? pollError(await store.read()) : {});
     }
   });
   server.tool("read_new_messages", "The background fetcher saves new Telegram messages. Show one page of local incoming messages that are not yet summarized. This tool never fetches Telegram updates. It never marks messages as read on Telegram. Set limit from 1 to 1000. The default is 200. The timeout field is kept for compatibility. It does not wait for Telegram. Call again while local messages are waiting. Omit mode to use the saved default. The initial mode is all. Mode all shows every readable incoming message in full. Mode for_me shows private messages, @mentions, and replies in full. Mentions and replies to the bot or owner count. Allowed chats, allowed users, and include matches also show in full. Other group messages show one count line per group. Both modes apply local filters. Text is cut at 500 characters. Muted chats show counts only. Protected words stop exclusions. Messages for the owner are kept by default. An exclude_rules item can hide them with include_for_me=true. Hidden messages show a count. Use get_chat_messages with show_filtered=true to view them. Owner messages in business chats are saved as context only.", {
@@ -261,11 +283,12 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
+      const username = await getUsername(entry, true);
       return await store.withLock(async () => {
         const state = await store.read();
         state.pending = state.pending.filter(([key, id]) =>
           state.chats[key]?.messages.some((message) => message.message_id === id));
-        const me = await filterMe(entry, state);
+        const me = await filterMe(entry, state, username);
         const rules = await readFilters(store.dir);
         const priority = (message) => {
           const chat = state.chats[chatKey(message.chat_id, message.business_connection_id)].chat;
@@ -276,8 +299,10 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
           .sort((a, b) => Number(priority(b)) - Number(priority(a))).slice(0, limit);
         const shown = new Set(messages.map((message) => `${chatKey(message.chat_id, message.business_connection_id)}:${message.message_id}`));
         state.pending = state.pending.filter(([key, id]) => !shown.has(`${key}:${id}`));
+        const notice = state.last_poll_error
+          ? `\n后台获取失败。Background fetch failed: ${state.last_poll_error}\n本地“没有新消息”可能已过时。Local "no new messages" may be stale.` : "";
         const result = plainTextResult(formatMessages({ bot_id: entry.id, messages, chats: state.chats, rules, me,
-          offset: state.offset, mode, pending: state.pending }), tokens);
+          offset: state.offset, mode, pending: state.pending }) + notice, tokens);
         await store.write(state);
         return result;
       });
@@ -295,6 +320,7 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
     try {
       const entry = await selectBot(bots, bot, getUsername);
       const store = openStore(dataDir, entry.id);
+      const username = show_filtered ? "" : await getUsername(entry, true);
       return await store.withLock(async () => {
         const state = await store.read();
         const rules = await readFilters(store.dir);
@@ -318,7 +344,7 @@ export function createServer({ env = process.env, fetch, dataDir, pollEnabled } 
           messages = saved.filter((message) => before_message_id === undefined || message.message_id < before_message_id)
             .slice(-limit).map((message) => ({ message, prefix: "" }));
         }
-        const me = messages.length && !show_filtered ? await filterMe(entry, state) : {};
+        const me = messages.length && !show_filtered ? await filterMe(entry, state, username) : {};
         const visible = messages.filter(({ message }) => show_filtered || classify(message, chat.chat, rules, me) !== "filtered");
         lines.push(...visible.map(({ message, prefix }) => prefix + formatMessage(message, chat.chat)));
         if (!lines.length) lines.push("No saved messages.");

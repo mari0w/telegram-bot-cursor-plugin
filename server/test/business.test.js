@@ -159,7 +159,11 @@ test("Receive looks up unknown connections and leaves the batch unchanged on loo
     const output = await call("read_new_messages");
     if (fail) {
       assert.match(polled.error, /Unknown connection/);
-      assert.deepEqual(await store.read(), initial);
+      const saved = await store.read();
+      assert.deepEqual(saved, { ...initial, last_poll_error: polled.error,
+        last_poll_error_at: saved.last_poll_error_at });
+      assert.equal(typeof saved.last_poll_error_at, "number");
+      assert.match(output, /Background fetch failed/);
       assert.equal((await store.read()).offset, 0);
     } else assert.match(output, /no new messages/);
     assert.equal(calls.filter(({ method }) => method === "getBusinessConnection").length, before + (fail ? 2 : 1));

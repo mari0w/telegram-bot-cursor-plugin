@@ -116,10 +116,58 @@ test("A locked bot is skipped and a failed bot does not stop other bots", async 
   assert.deepEqual(await server.pollOnce("101"), [{ bot_id: "101", skipped: true }]);
   assert.deepEqual(calls, []);
   await rm(lock);
+  assert.equal((await openStore(dataDir, 101).read()).last_poll_error, undefined);
   const results = await server.pollOnce();
   assert.match(results[0].error, /Fetch failed \[REDACTED\]/);
   assert.deepEqual(results[1], { bot_id: "202", more: false });
   assert.equal(logs.length, 1);
   for (const token of Object.values(env)) assert.ok(!logs[0].includes(token));
   assert.deepEqual((await openStore(dataDir, 202).read()).pending, [["7", 1]]);
+});
+
+test("Full batches start an immediate wave and keep the overlap guard", async (t) => {
+  const dataDir = await dataDirectory(t);
+  t.mock.method(globalThis, "setInterval", () => assert.fail("This test must not wait for an interval"));
+  let calls = 0;
+  let release;
+  let started;
+  const nextWave = new Promise((resolve) => { started = resolve; });
+  const server = createServer({ env, dataDir, pollEnabled: false, fetch: async (url, options) => {
+    assert.ok(url.includes("bot101:"));
+    const params = JSON.parse(options.body);
+    assert.equal(params.offset, calls * 100);
+    if (++calls === 21) {
+      started();
+      await new Promise((resolve) => { release = resolve; });
+      return Response.json({ ok: true, result: [] });
+    }
+    return Response.json({ ok: true,
+      result: Array.from({ length: 100 }, (_, i) => ({ update_id: (calls - 1) * 100 + i })) });
+  } });
+  t.after(() => server.close());
+  const cycle = server.pollOnce("101");
+  await nextWave;
+  assert.equal(calls, 21);
+  assert.deepEqual(await server.pollOnce("101"), [{ bot_id: "101", skipped: true }]);
+  release();
+  assert.deepEqual(await cycle, [{ bot_id: "101", more: false }]);
+  assert.equal((await openStore(dataDir, 101).read()).offset, 2000);
+});
+
+test("Immediate waves stop after ten follow-ups without progress and resume next cycle", async (t) => {
+  const dataDir = await dataDirectory(t);
+  const batches = Array.from({ length: 100 }, (_, i) => ({ update_id: i }));
+  let calls = 0;
+  let drained = false;
+  const server = createServer({ env: { TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN }, dataDir,
+    pollEnabled: false, fetch: async () => {
+      calls++;
+      return Response.json({ ok: true, result: drained ? [] : batches });
+    } });
+  t.after(() => server.close());
+  assert.deepEqual(await server.pollOnce("101"), [{ bot_id: "101", more: true }]);
+  assert.equal(calls, 220);
+  drained = true;
+  assert.deepEqual(await server.pollOnce("101"), [{ bot_id: "101", more: false }]);
+  assert.equal(calls, 221);
 });

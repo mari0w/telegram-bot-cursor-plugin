@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import initSqlJs from "sql.js";
 import { addBusinessConnection, addMessage, addUpdates, openStore } from "../store.js";
 
@@ -33,6 +34,43 @@ test("SQLite creates a private database with no user setup", async (t) => {
   assert.deepEqual(await query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"),
     [["chats"], ["messages"], ["meta"]]);
   await assert.rejects(readFile(path.join(store.dir, "store.json")), { code: "ENOENT" });
+});
+
+test("A caller waits for a short store lock and then saves without losing state", async (t) => {
+  const { store } = await setup(t);
+  let acquired;
+  const started = new Promise((resolve) => { acquired = resolve; });
+  const holder = store.withLock(async () => {
+    acquired();
+    await delay(150);
+    const state = await store.read();
+    addUpdates(state, [update(1)]);
+    await store.write(state);
+  });
+  await started;
+  await store.withLock(async () => {
+    const state = await store.read();
+    assert.deepEqual(state.pending, [["7", 1]]);
+    addUpdates(state, [update(2)]);
+    await store.write(state);
+  });
+  await holder;
+  assert.deepEqual((await store.read()).pending, [["7", 1], ["7", 2]]);
+});
+
+test("A held store lock retries before it returns STORE_BUSY", async (t) => {
+  const { store } = await setup(t);
+  await mkdir(store.dir, { recursive: true });
+  const lock = path.join(store.dir, "poll.lock");
+  await writeFile(lock, "");
+  const started = Date.now();
+  await assert.rejects(store.withLock(() => assert.fail("The lock is still held")), (error) => {
+    assert.equal(error.code, "STORE_BUSY");
+    assert.equal(error.message, `Another process is reading messages for this bot. Try again later. If no other process runs, delete ${lock}.`);
+    return true;
+  });
+  assert.ok(Date.now() - started >= 900);
+  assert.equal(await readFile(lock, "utf8"), "");
 });
 
 test("SQLite persists unsummarized rows and keeps summary timestamps", async (t) => {

@@ -2,6 +2,7 @@ import { chmod, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import initSqlJs from "sql.js";
 
 const require = createRequire(import.meta.url);
@@ -25,7 +26,8 @@ function saveState(db, state) {
   db.run("BEGIN");
   try {
     db.run("DELETE FROM meta; DELETE FROM chats; DELETE FROM messages;");
-    for (const key of ["offset", "business", "last_update_at", "last_poll_at"]) {
+    for (const key of ["offset", "business", "last_update_at", "last_poll_at",
+      "last_poll_error", "last_poll_error_at", "bot_username"]) {
       if (state[key] !== undefined) db.run("INSERT INTO meta VALUES (?, ?)", [key, JSON.stringify(state[key])]);
     }
     const insertChat = db.prepare("INSERT INTO chats VALUES (?, ?, ?, ?)");
@@ -141,15 +143,20 @@ export function openStore(dataDir = path.join(os.homedir(), ".telegram-bot-curso
     async withLock(fn) {
       await makeDir();
       let handle;
-      try {
-        handle = await open(lock, "wx", 0o600);
-      } catch (error) {
-        if (error.code === "EEXIST") {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          handle = await open(lock, "wx", 0o600);
+          break;
+        } catch (error) {
+          if (error.code !== "EEXIST") throw error;
+          if (attempt < 10) {
+            await delay(100);
+            continue;
+          }
           const busy = new Error(`Another process is reading messages for this bot. Try again later. If no other process runs, delete ${lock}.`);
           busy.code = "STORE_BUSY";
           throw busy;
         }
-        throw error;
       }
       try {
         return await fn();

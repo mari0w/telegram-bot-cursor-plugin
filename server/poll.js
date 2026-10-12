@@ -37,6 +37,8 @@ export async function pollBot(entry, { dataDir, fetch, env, tokens }) {
       }
       addUpdates(state, JSON.parse(redact(JSON.stringify(updates), tokens)));
       state.last_poll_at = Math.floor(Date.now() / 1000);
+      delete state.last_poll_error;
+      delete state.last_poll_error_at;
       await store.write(state);
       more = updates.length === 100;
       if (!more) break;
@@ -52,21 +54,40 @@ export function startPoller(server, bots, { pollEnabled, env, ...options }) {
   let timer;
   const poll = (entry) => {
     if (closed || active.has(entry.id)) return Promise.resolve({ bot_id: entry.id, skipped: true });
-    const task = pollBot(entry, { ...options, env }).catch((error) => {
+    const task = pollBot(entry, { ...options, env }).catch(async (error) => {
       if (error.code === "STORE_BUSY") return { bot_id: entry.id, skipped: true };
       const guidance = error.code === 409
         ? " Telegram returned 409 Conflict. Call get_webhook_info to check. A webhook or another poller can cause this. Use delete_webhook with confirm=true only after the user agrees." : "";
       const message = errorMessage(error, options.tokens) + guidance;
       console.error(`Background fetch failed for bot ${entry.id}: ${message}`);
+      const store = openStore(options.dataDir, entry.id);
+      try {
+        await store.withLock(async () => {
+          const state = await store.read();
+          state.last_poll_error = message;
+          state.last_poll_error_at = Math.floor(Date.now() / 1000);
+          await store.write(state);
+        });
+      } catch (storeError) {
+        console.error(`Could not save background fetch error for bot ${entry.id}: ${errorMessage(storeError, options.tokens)}`);
+      }
       return { bot_id: entry.id, error: message };
     }).finally(() => active.delete(entry.id));
     active.set(entry.id, task);
     return task;
   };
-  // Tests can run one fetch with timers disabled. Tools never call this helper.
+  // Tests can run a cycle with timers disabled. Tools never call this helper.
   server.pollOnce = async (botId) => {
-    const selected = botId === undefined ? bots : bots.filter((entry) => entry.id === String(botId));
-    return Promise.all(selected.map(poll));
+    let selected = botId === undefined ? bots : bots.filter((entry) => entry.id === String(botId));
+    const results = new Map();
+    for (let followups = 0; ; followups++) {
+      const cycle = await Promise.all(selected.map(poll));
+      for (const result of cycle) results.set(result.bot_id, result);
+      if (closed || followups === 10) break;
+      selected = selected.filter((entry, i) => cycle[i].more);
+      if (!selected.length) break;
+    }
+    return [...results.values()];
   };
   const close = server.close.bind(server);
   server.close = async () => {

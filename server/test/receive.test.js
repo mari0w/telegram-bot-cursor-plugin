@@ -14,12 +14,18 @@ const allowed_updates = ["message", "edited_message", "channel_post", "edited_ch
 const update = (id, chat = 7) => ({ update_id: id, message: { message_id: id, date: id,
   chat: { id: chat, type: "private", first_name: "User" }, text: `Message ${id}` } });
 
-async function setup(t, reply) {
+async function setup(t, reply, { failGetMe = false } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "telegram-store-"));
   const calls = [];
   const server = createServer({ pollEnabled: false, env, dataDir, fetch: async (url, options) => {
     const method = url.split("/").at(-1);
-    if (method === "getMe") return { json: async () => ({ ok: true, result: { id: 101, username: "my_bot" } }) };
+    if (method === "getMe") {
+      if (failGetMe) {
+        calls.push({ method });
+        throw new Error("Telegram is unreachable");
+      }
+      return { json: async () => ({ ok: true, result: { id: 101, username: "my_bot" } }) };
+    }
     calls.push({ method, params: JSON.parse(options.body), signal: options.signal });
     return { json: async () => reply(method, calls.at(-1).params) };
   } });
@@ -217,19 +223,19 @@ test("Receive shows 150 pending messages in two pages with no repeats", async (t
   assert.equal(calls.length, 0);
 });
 
-test("Receive stops after 20 full batches and keeps messages for the next page", async (t) => {
+test("Receive fetches the next wave after 20 full batches and keeps pending pages", async (t) => {
   let id = 0;
   const { pollOnce, call, calls, dataDir } = await setup(t, () => ({ ok: true,
-    result: Array.from({ length: 100 }, () => update(++id)) }));
+    result: Array.from({ length: id < 2000 ? 100 : 50 }, () => update(++id)) }));
   await pollOnce();
   const output = await call("read_new_messages");
-  assert.match(output, /200 new messages\. offset 2001\./);
+  assert.match(output, /200 new messages\. offset 2051\./);
   assert.doesNotMatch(output, /More updates are waiting/);
-  assert.match(output, /还有 1800 条没显示/);
-  assert.equal(calls.length, 20);
+  assert.match(output, /还有 1850 条没显示/);
+  assert.equal(calls.length, 21);
   const saved = await openStore(dataDir, 101).read();
-  assert.equal(saved.chats[7].messages.length, 2000);
-  assert.equal(saved.pending.length, 1800);
+  assert.equal(saved.chats[7].messages.length, 2050);
+  assert.equal(saved.pending.length, 1850);
 });
 
 test("One poll saves SQLite pages; local reads drain them with fetch disabled", async (t) => {
@@ -332,7 +338,7 @@ test("Chat history leaves summary progress unchanged", async (t) => {
   const { call, dataDir } = await setup(t, () => ({ ok: true, result: [] }));
   const store = openStore(dataDir, 101);
   for (const args of [{ limit: 2 }, { message_id: 3, context: 0 }]) {
-    const state = { offset: 0, chats: {}, pending: [] };
+    const state = { offset: 0, chats: {}, pending: [], bot_username: "my_bot" };
     const updates = [update(1), update(2), update(3), update(1, 8)];
     updates[2].message.reply_to_message = { message_id: 1 };
     addUpdates(state, updates);
@@ -448,7 +454,7 @@ test("Filter previews classify all saved chats, cap examples, and never save wit
   assert.ok(examples.every((line) => Array.from(line.split("：")[1]).length <= 61 && line.endsWith("…")));
   assert.doesNotMatch(preview, /regex|JSON|chat_id/);
   await assert.rejects(readFile(file), { code: "ENOENT" });
-  assert.deepEqual(await store.read(), state);
+  assert.deepEqual(await store.read(), { ...state, bot_username: "my_bot" });
   await call("set_filters", { exclude_rules, confirm: true });
   assert.deepEqual(JSON.parse(await readFile(file, "utf8")).exclude_rules, exclude_rules);
   assert.equal((await stat(file)).mode & 0o777, 0o600);
@@ -497,16 +503,83 @@ test("Webhook deletion needs confirmation; webhook info redacts all configured t
 test("Poll errors give webhook guidance and release the lock", async (t) => {
   const logs = [];
   t.mock.method(console, "error", (message) => logs.push(message));
-  const { pollOnce, call, dataDir } = await setup(t, () => ({ ok: false, error_code: 409,
-    description: `Conflict ${Object.values(env).join(" ")}` }));
+  let failed = true;
+  const { pollOnce, call, dataDir } = await setup(t, () => failed
+    ? { ok: false, error_code: 409, description: `Conflict ${Object.values(env).join(" ")}` }
+    : { ok: true, result: [] });
+  const store = openStore(dataDir, 101);
+  const state = await store.read();
+  addUpdates(state, [update(1)]);
+  await store.write(state);
   const [result] = await pollOnce();
   assert.match(result.error, /409 Conflict.*get_webhook_info.*delete_webhook with confirm=true/);
   assert.match(result.error, /Telegram API getUpdates failed: 409 Conflict \[REDACTED\]/);
   assert.equal(logs.length, 1);
   for (const token of Object.values(env)) assert.ok(!logs[0].includes(token));
-  assert.match(await call("read_new_messages"), /no new messages/);
+  const saved = await store.read();
+  assert.equal(saved.last_poll_error, result.error);
+  assert.equal(typeof saved.last_poll_error_at, "number");
+  const output = await call("read_new_messages", { bot: "101" });
+  assert.match(output, /Message 1/);
+  assert.match(output, /后台获取失败。Background fetch failed:.*409 Conflict/);
+  assert.match(output, /Local "no new messages" may be stale/);
+  assert.match(await call("read_new_messages", { bot: "101" }), /no new messages.*\n后台获取失败/s);
+  for (const info of [(await call("list_bots"))[0], await call("get_me", { bot: "101" })]) {
+    assert.equal(info.poll_error, saved.last_poll_error);
+    assert.equal(info.poll_error_at, saved.last_poll_error_at);
+  }
   await assert.rejects(readFile(path.join(dataDir, "101/poll.lock")), { code: "ENOENT" });
-  assert.deepEqual(await openStore(dataDir, 101).read(), { offset: 0, chats: {}, pending: [] });
+  failed = false;
+  await pollOnce();
+  const recovered = await store.read();
+  assert.equal(typeof recovered.last_poll_at, "number");
+  assert.equal(Object.hasOwn(recovered, "last_poll_error"), false);
+  assert.equal(Object.hasOwn(recovered, "last_poll_error_at"), false);
+  assert.doesNotMatch(await call("read_new_messages", { bot: "101" }), /Background fetch failed|may be stale/);
+  for (const info of [(await call("list_bots"))[0], await call("get_me", { bot: "101" })]) {
+    assert.equal(Object.hasOwn(info, "poll_error"), false);
+    assert.equal(Object.hasOwn(info, "poll_error_at"), false);
+  }
+});
+
+test("Local reads use saved identity or an empty username when Telegram is down", async (t) => {
+  for (const bot_username of ["my_bot", undefined]) {
+    const { call, calls, dataDir } = await setup(t, () => assert.fail("Local reads must not fetch updates"), { failGetMe: true });
+    const store = openStore(dataDir, 101);
+    const state = await store.read();
+    state.bot_username = bot_username;
+    addUpdates(state, [update(1), { update_id: 2, message: { ...update(2).message,
+      chat: { id: -7, type: "group", title: "Group" }, text: "@my_bot Mention" } }]);
+    await store.write(state);
+    const output = await call("read_new_messages", { bot: "101", mode: "for_me" });
+    assert.match(output, /Message 1/);
+    if (bot_username) assert.match(output, /@my_bot Mention/);
+    else assert.doesNotMatch(output, /@my_bot Mention/);
+    assert.deepEqual((await store.read()).pending, []);
+    assert.deepEqual(calls.map(({ method }) => method), ["getMe"]);
+  }
+});
+
+test("Identity tools persist the username for a later local read", async (t) => {
+  for (const tool of ["get_me", "list_bots", "read_new_messages"]) {
+    const { call, dataDir } = await setup(t, () => assert.fail("Identity must not fetch updates"));
+    await call(tool, tool === "list_bots" ? {} : { bot: "101" });
+    assert.equal((await openStore(dataDir, 101).read()).bot_username, "my_bot");
+  }
+});
+
+test("Identity tools show poll errors when Telegram is unreachable", async (t) => {
+  const { call, dataDir } = await setup(t, () => assert.fail("Must not fetch updates"), { failGetMe: true });
+  const store = openStore(dataDir, 101);
+  await store.write({ offset: 0, chats: {}, pending: [], last_poll_error: "Fetch failed", last_poll_error_at: 123 });
+  const info = (await call("list_bots"))[0];
+  assert.equal(info.ok, false);
+  assert.equal(info.poll_error, "Fetch failed");
+  assert.equal(info.poll_error_at, 123);
+  const me = await call("get_me", { bot: "101" });
+  assert.equal(me.isError, true);
+  assert.match(me.content[0].text, /"poll_error": "Fetch failed"/);
+  assert.match(me.content[0].text, /"poll_error_at": 123/);
 });
 
 test("Channel edits, captions, and each file kind use short fields", () => {
