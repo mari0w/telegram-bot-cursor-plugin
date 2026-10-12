@@ -60,27 +60,24 @@ It can tell you which steps you still need to complete.
 
 Ask the AI: “Read my new Telegram messages.”
 插件运行时，会自动在后台获取新消息。
-默认每 60 秒检查一次。
+默认每 2 分钟检查一次。
+这是默认行为。普通使用者不用改设置。
 Background fetch starts when the plugin starts.
 Ask the AI to show saved new messages when you need them.
+The AI only reads what is already saved locally.
+It does not pull from Telegram by itself.
 Each read shows up to 200 messages by default.
 It shows only messages that have not yet been summarized here.
 It never marks messages as read on Telegram.
 Reading chat history does not change this progress.
 
-在插件 Configure 中，可以关闭自动获取。
-Set **Background fetch** to `off` and restart the plugin.
-关闭后，插件不会自动从 Telegram 获取新消息。
-`read_new_messages` 只显示已经保存、但还没有总结的消息。
-要再次获取 Telegram 新消息，请重新打开后台获取。
-Clear the setting or set it to `on`, then restart the plugin.
-To change the wait, set **Fetch interval in seconds** to 30–600.
-Leave it blank to use 60 seconds.
-Restart the plugin after a change.
-
 消息会自动保存在本机的 SQLite 数据库中。
 不需要另外安装数据库。
 旧消息会自动迁移。
+后台默认只保存文字，以及图片或附件的引用。
+它不会把图片或文件提前下载到本机。
+需要看图或下载附件时，再让 AI 按那条消息去下载。
+
 If the result says 「还有 N 条没显示」, ask the AI to show the next page.
 The result also shows how many messages remain in each chat.
 You can ask for messages from one group instead.
@@ -189,6 +186,8 @@ Other people in the chat can see what it sends.
 You can add a caption or reply to a message.
 You can ask to send without a notification sound.
 Ask the AI to download a received file to your computer.
+Background fetch does not download files for you.
+It only saves a reference for later.
 Downloading a file does not need approval.
 
 A photo from your computer can be up to 10 MB.
@@ -729,6 +728,9 @@ An edit to a summarized incoming message makes it available again.
 
 The store keeps the last 2000 messages per chat and any older unsummarized messages.
 It saves filtered messages too. It stores short fields only.
+For media it stores `file_id` and related metadata.
+It does not download photo or file bytes during background fetch.
+Use `download_file` when a local copy is needed.
 It does not store a token.
 The poller omits a stale or unknown offset after 6 idle days.
 `last_update_at` changes only after a nonempty batch.
@@ -744,20 +746,30 @@ The old file becomes `store.json.migrated`.
 If import fails, the plugin logs the error and uses empty SQLite.
 The old file is archived. The plugin stops writing live message data to JSON.
 
-### Background fetch settings
+### Advanced: background fetch settings
 
-Configure exposes these settings through `mcp.json` and the plugin variables.
+Most people can ignore this section.
+Background fetch is on by default.
+It checks about every 2 minutes.
+Configure exposes optional settings through `mcp.json` and the plugin variables.
 Environment settings also work when you run the server directly.
 Restart the plugin after a change.
 
 | Variable | Meaning |
 | --- | --- |
 | `TELEGRAM_POLL_ENABLED` | Default: on. Empty, `1`, `true`, and `yes` mean on. `0`, `false`, `no`, and `off` mean off. Letter case does not matter. |
-| `TELEGRAM_POLL_INTERVAL_SEC` | Default: 60 seconds. Values are limited to 30–600 seconds. Empty or invalid values use 60. |
+| `TELEGRAM_POLL_INTERVAL_SEC` | Default: 120 seconds (2 minutes). Values are limited to 30–600 seconds. Empty or invalid values use 120. |
 
-When fetch is off, the plugin does not auto-fetch Telegram messages.
-`read_new_messages` only shows local unsummarized messages.
-Turn fetch back on to get new Telegram messages again.
+在插件 Configure 中，可以关闭自动获取或改间隔。
+Set **Background fetch** to `off` and restart the plugin.
+关闭后，插件不会自动从 Telegram 获取新消息。
+`read_new_messages` 只显示已经保存、但还没有总结的消息。
+要再次获取 Telegram 新消息，请重新打开后台获取。
+Clear the setting or set it to `on`, then restart the plugin.
+To change the wait, set **Fetch interval in seconds** to 30–600.
+Leave it blank to use 120 seconds (2 minutes).
+Restart the plugin after a change.
+
 Tests use `createServer({ pollEnabled: false })` to disable the timer.
 They use `server.pollOnce(botId)` to fetch one cycle.
 Omit `botId` to test all configured bots.

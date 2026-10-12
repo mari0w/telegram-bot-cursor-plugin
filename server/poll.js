@@ -9,7 +9,7 @@ export function pollSettings(env) {
   const enabled = !["0", "false", "no", "off"].includes(env.TELEGRAM_POLL_ENABLED?.trim().toLowerCase());
   const interval = env.TELEGRAM_POLL_INTERVAL_SEC?.trim();
   const seconds = Number(interval);
-  const intervalSec = interval && Number.isFinite(seconds) ? Math.max(30, Math.min(600, seconds)) : 60;
+  const intervalSec = interval && Number.isFinite(seconds) ? Math.max(30, Math.min(600, seconds)) : 120;
   return { enabled, intervalSec };
 }
 

@@ -25,7 +25,7 @@
       "TELEGRAM_POLL_INTERVAL_SEC": {
         "type": "string",
         "title": "Fetch interval in seconds (optional)",
-        "description": "Leave blank for 60 seconds. Use 30 to 600 seconds."
+        "description": "Leave blank for 120 seconds (2 minutes). Use 30 to 600 seconds."
       }
     },
     "required": ["TELEGRAM_BOT_TOKEN"]

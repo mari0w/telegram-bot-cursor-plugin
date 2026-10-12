@@ -18,7 +18,7 @@ Use the tools in version 1.2.0.
 9. Ask the user to change the token in plugin Configure only for a 401 Unauthorized error.
 
 The plugin fetches new messages in the background by default.
-It checks when the plugin starts and then every 60 seconds.
+It checks when the plugin starts and then every 2 minutes.
 `read_new_messages` reads only local messages that have not yet been summarized.
 It never calls `getUpdates`.
 The `timeout` field is kept but does not wait for Telegram.
@@ -31,6 +31,8 @@ When background fetch is off, the plugin does not fetch new Telegram messages.
 The read tool can only show messages already saved.
 Tell the user to turn background fetch back on to get new messages.
 SQLite storage and migration from the old JSON store are automatic.
+Background fetch saves message text and file references only.
+It does not download photos or files until the user asks to download one.
 The local store keeps the last 2000 messages per chat and older unsummarized messages.
 Keep the plugin running with background fetch on.
 Telegram drops updates older than 24 hours.

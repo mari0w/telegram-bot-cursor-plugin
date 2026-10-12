@@ -24,8 +24,8 @@ test("Background fetch settings have plain defaults and bounded intervals", () =
   for (const value of ["0", "false", "no", "off", " OFF "]) {
     assert.equal(pollSettings({ TELEGRAM_POLL_ENABLED: value }).enabled, false);
   }
-  assert.equal(pollSettings({}).intervalSec, 60);
-  for (const [value, expected] of [["", 60], ["bad", 60], ["Infinity", 60], ["-10", 30], ["0", 30], ["5", 30], ["90", 90], ["900", 600]]) {
+  assert.equal(pollSettings({}).intervalSec, 120);
+  for (const [value, expected] of [["", 120], ["bad", 120], ["Infinity", 120], ["-10", 30], ["0", 30], ["5", 30], ["90", 90], ["120", 120], ["900", 600]]) {
     assert.equal(pollSettings({ TELEGRAM_POLL_INTERVAL_SEC: value }).intervalSec, expected);
   }
 });
